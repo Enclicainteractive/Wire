@@ -157,6 +157,12 @@ bot.on('memberJoin', (data) => {
 
 bot.on('error', (err) => {
   console.error('[Wilmer] Error:', err.message)
+  if (err.gatewayUrl)  console.error('[Wilmer]   Gateway URL :', err.gatewayUrl)
+  if (err.detail)      console.error('[Wilmer]   Detail      :', err.detail)
+  if (err.description) console.error('[Wilmer]   Description :', err.description)
+  if (err.type)        console.error('[Wilmer]   Type        :', err.type)
+  if (err.cause)       console.error('[Wilmer]   Cause       :', err.cause?.message ?? err.cause)
+  if (err.stack)       console.error('[Wilmer]   Stack       :', err.stack)
 })
 
 bot.on('disconnect', (reason) => {
@@ -177,7 +183,14 @@ function formatUptime(ms) {
 }
 
 // --- Start ---
+console.log(`[Wilmer] Starting — server: ${SERVER_URL}`)
 bot.login(BOT_TOKEN, SERVER_URL).catch(err => {
   console.error('[Wilmer] Failed to start:', err.message)
+  if (err.gatewayUrl)  console.error('[Wilmer]   Gateway URL :', err.gatewayUrl)
+  if (err.detail)      console.error('[Wilmer]   Detail      :', err.detail)
+  if (err.description) console.error('[Wilmer]   Description :', err.description)
+  if (err.type)        console.error('[Wilmer]   Type        :', err.type)
+  if (err.cause)       console.error('[Wilmer]   Cause       :', err.cause?.message ?? err.cause)
+  if (err.stack)       console.error('[Wilmer]   Stack       :\n', err.stack)
   process.exit(1)
 })

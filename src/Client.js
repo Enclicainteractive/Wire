@@ -42,24 +42,52 @@ export class Client extends EventEmitter {
 
     this.bot = me
     this._log('Authenticated as', me.name, `(${me.id})`)
+    this._log('Gateway URL from server:', gateway.url || '(none, using serverUrl)')
 
-    // Connect via WebSocket
-    return this._connectGateway(gateway.url || this.serverUrl)
+    // Connect via WebSocket. Prefer the URL returned by the gateway endpoint;
+    // fall back to the serverUrl passed to login().
+    const gatewayUrl = gateway.url || this.serverUrl
+    return this._connectGateway(gatewayUrl)
   }
 
-  _connectGateway(url) {
+  _normalizeGatewayUrl(url) {
+    // socket.io-client requires an http:// or https:// base URL — it handles
+    // the WebSocket upgrade internally. If the gateway returns a raw ws:// or
+    // wss:// URL, convert it so io() does not fail immediately.
+    if (typeof url !== 'string') return url
+    return url.replace(/^wss:\/\//i, 'https://').replace(/^ws:\/\//i, 'http://')
+  }
+
+  _connectGateway(rawUrl) {
+    const url = this._normalizeGatewayUrl(rawUrl)
+    if (url !== rawUrl) {
+      this._log(`Gateway URL normalized: ${rawUrl} -> ${url}`)
+    }
+
+    // Derive whether TLS should be forced from the final URL scheme.
+    // This matters because engine.io-client builds the WebSocket URL
+    // independently from the base URL scheme. If the server returns an
+    // HTTP 301 redirect (http → https), the ws:// upgrade request is
+    // rejected with "Unexpected server response: 301" because the ws
+    // library does not follow redirects. Setting `secure: true` forces
+    // engine.io to always use wss:// regardless of polling results.
+    const secure = url.startsWith('https://')
+
     return new Promise((resolve, reject) => {
       const authToken = this.userToken || this.token
+
+      this._log(`Connecting to gateway: ${url} (secure=${secure})`)
 
       this.socket = io(url, {
         auth: { token: authToken },
         reconnection: this._reconnect,
         reconnectionDelay: this._reconnectDelay,
-        transports: ['websocket', 'polling']
+        transports: ['websocket', 'polling'],
+        secure
       })
 
       this.socket.on('connect', () => {
-        this._log('WebSocket connected')
+        this._log('WebSocket connected (transport:', this.socket.io.engine.transport.name + ')')
         this.socket.emit('bot:connect', { botToken: this.token })
       })
 
@@ -147,7 +175,23 @@ export class Client extends EventEmitter {
       })
 
       this.socket.on('connect_error', (err) => {
-        this._log('Connection error:', err.message)
+        // Attach full diagnostic context to the error before emitting/rejecting
+        // so callers can log or inspect the real underlying failure.
+        const detail = [
+          `message: ${err.message}`,
+          err.description ? `description: ${err.description}` : null,
+          err.type       ? `type: ${err.type}`                : null,
+          err.context    ? `context: ${JSON.stringify(err.context)}` : null,
+          err.cause      ? `cause: ${err.cause?.message ?? err.cause}` : null,
+        ].filter(Boolean).join(' | ')
+
+        this._log(`Connection error [${url}] — ${detail}`)
+        if (this._debug && err.stack) console.log('[Wire] Stack:', err.stack)
+
+        // Enrich the error object so upstream handlers have full detail
+        err.gatewayUrl = url
+        err.detail = detail
+
         this.emit('error', err)
         if (!this.readyAt) reject(err)
       })

@@ -1,6 +1,6 @@
 {
   "name": "@voltchat/wire",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "The official VoltChat bot framework. Build bots that respond to messages, run commands, and automate your servers.",
   "main": "src/index.js",
   "type": "module",
@@ -23,7 +23,7 @@
   "homepage": "https://github.com/Enclicainteractive/Wire#readme",
   "repository": {
     "type": "git",
-    "url": "https://github.com/Enclicainteractive/Wire.git"
+    "url": "git+https://github.com/Enclicainteractive/Wire.git"
   },
   "bugs": {
     "url": "https://github.com/Enclicainteractive/Wire/issues"
