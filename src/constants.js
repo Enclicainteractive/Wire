@@ -30,10 +30,18 @@ export const GatewayEvents = {
   // Typing
   TYPING_START:     'user:typing',
 
-  // Voice
-  VOICE_JOIN:       'voice:user-joined',
-  VOICE_LEAVE:      'voice:user-left',
-  VOICE_USER_UPDATE:'voice:user-updated',
+  // Voice — presence (server → client broadcasts)
+  VOICE_JOIN:            'voice:user-joined',
+  VOICE_LEAVE:           'voice:user-left',
+  VOICE_USER_UPDATE:     'voice:user-updated',
+
+  // Voice — WebRTC signaling (client ↔ client via server relay)
+  VOICE_OFFER:           'voice:offer',
+  VOICE_ANSWER:          'voice:answer',
+  VOICE_ICE_CANDIDATE:   'voice:ice-candidate',
+  VOICE_PARTICIPANTS:    'voice:participants',
+  VOICE_GET_PARTICIPANTS:'voice:get-participants',
+  VOICE_HEARTBEAT:       'voice:heartbeat',
 
   // User presence
   USER_STATUS:      'user:status',

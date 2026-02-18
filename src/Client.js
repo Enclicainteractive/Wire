@@ -3,6 +3,7 @@ import { EventEmitter } from './EventEmitter.js'
 import { RestClient } from './RestClient.js'
 import { CommandRegistry } from './CommandRegistry.js'
 import { Message } from './Message.js'
+import { VoiceConnection } from './VoiceConnection.js'
 import { GatewayEvents, BotStatus } from './constants.js'
 
 export class Client extends EventEmitter {
@@ -26,6 +27,9 @@ export class Client extends EventEmitter {
     this._reconnectDelay  = options.reconnectDelay || 5000
     this._debug           = options.debug || false
     this._typingTimers    = new Map()   // channelId -> timer handle
+
+    // Voice — keyed by serverId so one connection per server
+    this._voiceConnections = new Map()  // serverId -> VoiceConnection
   }
 
   // ---------------------------------------------------------------------------
@@ -252,6 +256,17 @@ export class Client extends EventEmitter {
 
       this.socket.on('reconnect', () => {
         this._log('Reconnected')
+        // Re-join any active voice channels after a gateway reconnect
+        for (const vc of this._voiceConnections.values()) {
+          if (vc.connected) {
+            this._log(`Re-joining voice channel ${vc.channelId} after reconnect`)
+            this.socket.emit('voice:join', {
+              channelId: vc.channelId,
+              serverId:  vc.serverId,
+              peerId:    this.bot?.id,
+            })
+          }
+        }
         this.emit('reconnect')
       })
 
@@ -364,6 +379,55 @@ export class Client extends EventEmitter {
   }
 
   // ---------------------------------------------------------------------------
+  // Voice
+  // ---------------------------------------------------------------------------
+
+  /**
+   * Join a voice channel and return a VoiceConnection.
+   * If the bot is already in a voice channel in the same server the existing
+   * connection is left first.
+   *
+   * @param {string} serverId
+   * @param {string} channelId
+   * @param {object} [options]
+   * @param {boolean} [options.debug]   Enable verbose WebRTC logging
+   * @returns {Promise<VoiceConnection>}
+   */
+  async joinVoice(serverId, channelId, options = {}) {
+    // Leave any existing connection in this server
+    await this.leaveVoice(serverId)
+
+    const vc = new VoiceConnection(this.socket, this.bot?.id, serverId, channelId, {
+      debug: this._debug || options.debug,
+    })
+    this._voiceConnections.set(serverId, vc)
+
+    await vc.join()
+    return vc
+  }
+
+  /**
+   * Leave the voice channel in the given server (if any).
+   * @param {string} serverId
+   */
+  async leaveVoice(serverId) {
+    const vc = this._voiceConnections.get(serverId)
+    if (vc) {
+      vc.leave()
+      this._voiceConnections.delete(serverId)
+    }
+  }
+
+  /**
+   * Get the active VoiceConnection for a server, or undefined.
+   * @param {string} serverId
+   * @returns {VoiceConnection|undefined}
+   */
+  getVoiceConnection(serverId) {
+    return this._voiceConnections.get(serverId)
+  }
+
+  // ---------------------------------------------------------------------------
   // Lifecycle
   // ---------------------------------------------------------------------------
 
@@ -383,6 +447,9 @@ export class Client extends EventEmitter {
    */
   destroy() {
     this._clearAllTypingTimers()
+    // Tear down all voice connections cleanly
+    for (const vc of this._voiceConnections.values()) vc.leave()
+    this._voiceConnections.clear()
     this.rest?.setStatus(BotStatus.OFFLINE).catch(() => {})
     this.socket?.disconnect()
     this.removeAllListeners()
