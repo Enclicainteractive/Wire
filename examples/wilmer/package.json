@@ -1,0 +1,13 @@
+{
+  "name": "wilmer-bot",
+  "version": "1.0.0",
+  "description": "Wilmer - an example VoltChat bot built with @voltchat/wire",
+  "main": "index.js",
+  "type": "module",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "@voltchat/wire": "file:../../"
+  }
+}
