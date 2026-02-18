@@ -118,7 +118,7 @@ bot.commands.add({
       .addField('Uptime', formatUptime(bot.uptime), true)
       .addField('Servers', String(bot.bot?.servers?.length || 0), true)
       .addField('Commands', String(bot.commands.toArray().length), true)
-      .setFooter('github.com/voltchat/wire')
+      .setFooter('github.com/Enclicainteractive/Wire')
       .setTimestamp()
     await message.reply({ content: '', embeds: [embed.toJSON()] })
   }

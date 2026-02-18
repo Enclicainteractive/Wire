@@ -118,6 +118,8 @@ const members = await rest.getServerMembers(serverId)
 
 Receive events via HTTP instead of WebSocket.
 
+GitHub: [Enclicainteractive/Wire](https://github.com/Enclicainteractive/Wire)
+
 ```javascript
 import { WebhookServer } from '@voltchat/wire'
 
