@@ -101,7 +101,7 @@ export class Message {
    * Send a typing indicator in this message's channel.
    */
   async startTyping() {
-    return this._client.rest.sendTyping(this.channelId)
+    return this._client.rest.sendTyping(this.channelId).catch(() => {})
   }
 
   // ---------------------------------------------------------------------------
