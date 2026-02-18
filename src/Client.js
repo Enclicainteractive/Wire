@@ -52,10 +52,18 @@ export class Client extends EventEmitter {
 
   _normalizeGatewayUrl(url) {
     // socket.io-client requires an http:// or https:// base URL — it handles
-    // the WebSocket upgrade internally. If the gateway returns a raw ws:// or
-    // wss:// URL, convert it so io() does not fail immediately.
+    // the WebSocket upgrade internally. Convert raw ws(s):// URLs first.
     if (typeof url !== 'string') return url
-    return url.replace(/^wss:\/\//i, 'https://').replace(/^ws:\/\//i, 'http://')
+    url = url.replace(/^wss:\/\//i, 'https://').replace(/^ws:\/\//i, 'http://')
+
+    // The gateway endpoint may return an http:// URL even when the server is
+    // HTTPS-only (a common server-side misconfiguration). If the serverUrl the
+    // user provided is https://, honour that and upgrade the gateway URL too so
+    // engine.io uses wss:// and avoids the HTTP 301 redirect that the ws
+    // library cannot follow during a WebSocket upgrade.
+    if (this.serverUrl?.startsWith('https://') && url.startsWith('http://')) {
+      url = 'https://' + url.slice('http://'.length)
+    }
   }
 
   _connectGateway(rawUrl) {
