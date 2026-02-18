@@ -64,6 +64,8 @@ export class Client extends EventEmitter {
     if (this.serverUrl?.startsWith('https://') && url.startsWith('http://')) {
       url = 'https://' + url.slice('http://'.length)
     }
+
+    return url
   }
 
   _connectGateway(rawUrl) {

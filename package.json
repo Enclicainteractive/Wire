@@ -1,6 +1,6 @@
 {
   "name": "@voltchat/wire",
-  "version": "1.0.2",
+  "version": "1.0.3",
   "description": "The official VoltChat bot framework. Build bots that respond to messages, run commands, and automate your servers.",
   "main": "src/index.js",
   "type": "module",
