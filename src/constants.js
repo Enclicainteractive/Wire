@@ -43,8 +43,9 @@ export const GatewayEvents = {
   VOICE_GET_PARTICIPANTS:'voice:get-participants',
   VOICE_HEARTBEAT:       'voice:heartbeat',
 
-  // User presence
-  USER_STATUS:      'user:status',
+  // User / bot presence
+  USER_STATUS:        'user:status',
+  BOT_STATUS_CHANGE:  'bot:status-change',
 }
 
 export const Intents = {

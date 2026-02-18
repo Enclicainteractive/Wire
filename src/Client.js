@@ -336,11 +336,21 @@ export class Client extends EventEmitter {
   }
 
   /**
-   * Set the bot's status.
+   * Set the bot's status and optional custom status text.
+   *
+   * Emits a `bot:status-change` event over the already-open WebSocket for
+   * an instant broadcast to all connected clients, then also persists the
+   * change via the REST API so it survives reconnects.
+   *
    * @param {'online'|'idle'|'dnd'|'offline'} status
-   * @param {string} [customStatus]
+   * @param {string|null} [customStatus]  Short text shown under the bot's name
    */
-  async setStatus(status, customStatus) {
+  async setStatus(status, customStatus = null) {
+    // Instant path — push over the live socket so the sidebar updates now
+    if (this.socket?.connected) {
+      this.socket.emit('bot:status-change', { status, customStatus })
+    }
+    // Persist path — REST call so the status survives a reconnect
     return this.rest.setStatus(status, customStatus)
   }
 

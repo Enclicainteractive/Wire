@@ -1,6 +1,6 @@
 # @voltchat/wire
 
-The official bot framework for VoltChat. Build bots that respond to messages, run commands, moderate servers, and react to every platform event.
+The official bot framework for VoltChat. Build bots that respond to messages, run commands, moderate servers, stream audio into voice channels, and react to every platform event.
 
 ## Install
 
@@ -13,7 +13,7 @@ Requires Node.js ≥ 18. Pure ES modules (`"type": "module"`).
 ## Quick Start
 
 ```js
-import { Client } from '@voltchat/wire'
+import { Client, BotStatus } from '@voltchat/wire'
 
 const bot = new Client({ prefix: '!' })
 
@@ -25,8 +25,9 @@ bot.commands.add({
   }
 })
 
-bot.on('ready', (info) => {
+bot.on('ready', async (info) => {
   console.log(`${info.name} is online in ${info.servers.length} servers`)
+  await bot.setStatus(BotStatus.ONLINE, 'Ready to help!')
 })
 
 bot.login('vbot_your_token', 'https://your-volt-server.com')
@@ -74,7 +75,12 @@ await bot.login(token, serverUrl)
 await bot.send(channelId, 'Hello!', { embeds: [...] })
 
 // Status — 'online' | 'idle' | 'dnd' | 'offline'
-await bot.setStatus('idle', 'Taking a break')
+// Instantly broadcasts over the WebSocket AND persists via REST.
+// customStatus appears under the bot's name in the members sidebar.
+await bot.setStatus('idle')
+await bot.setStatus('dnd',    'Do not disturb')
+await bot.setStatus('online', 'Listening to music 🎵')
+await bot.setStatus('offline')          // clears customStatus too
 
 // Typing indicator
 await bot.startTyping(channelId)             // one-shot
@@ -85,6 +91,12 @@ bot.stopTyping(channelId)
 const members  = await bot.fetchMembers(serverId)
 const channels = await bot.fetchChannels(serverId)
 const server   = await bot.fetchServer(serverId)
+
+// Voice (requires @roamhq/wrtc)
+const vc = await bot.joinVoice(serverId, channelId)
+await vc.playFile('./audio.mp3')
+await bot.leaveVoice(serverId)
+const vc = bot.getVoiceConnection(serverId)  // undefined if not in voice
 
 // Graceful shutdown
 bot.destroy()
@@ -110,10 +122,12 @@ bot.on('channelUpdate',  (data)    => {})
 bot.on('channelDelete',  (data)    => {})
 bot.on('serverUpdate',   (data)    => {})
 bot.on('typingStart',    (data)    => {})
-bot.on('voiceJoin',      (data)    => {})
+bot.on('voiceJoin',      (data)    => {})   // { userId, channelId, … }
 bot.on('voiceLeave',     (data)    => {})
 bot.on('voiceUpdate',    (data)    => {})
-bot.on('userStatus',     (data)    => {})
+bot.on('userStatus',     (data)    => {})   // { userId, status, customStatus, isBot }
+bot.on('peerJoin',       (userId)  => {})   // VoiceConnection event (see Voice)
+bot.on('peerLeave',      (userId)  => {})
 bot.on('disconnect',     (reason)  => {})
 bot.on('reconnect',      ()        => {})
 bot.on('error',          (err)     => {})
@@ -194,6 +208,132 @@ bot.commands.toArray()
 
 ---
 
+### Voice
+
+Stream audio into VoltChat voice channels using WebRTC. Requires the native `@roamhq/wrtc` package.
+
+```bash
+npm install @roamhq/wrtc
+```
+
+Also requires `ffmpeg` to be installed and available on `PATH` (used to decode audio files to raw PCM).
+
+#### Joining and playing audio
+
+```js
+bot.on('ready', async () => {
+  const vc = await bot.joinVoice(serverId, channelId)
+
+  // playFile() buffers the decoded PCM immediately but holds the pump
+  // until a WebRTC peer connection is established — so audio is never
+  // silently discarded during the ICE negotiation window.
+  await vc.playFile('./audio.mp3')
+
+  vc.on('finish', () => console.log('Done playing'))
+  vc.on('error',  (err) => console.error('Voice error:', err.message))
+})
+```
+
+#### `VoiceConnection` API
+
+```js
+const vc = await bot.joinVoice(serverId, channelId)
+// or
+const vc = bot.getVoiceConnection(serverId)   // undefined if not connected
+
+await vc.playFile(filePath)             // play any file ffmpeg can decode
+await vc.playFile(filePath, { loop: true }) // loop until stopAudio()
+vc.stopAudio()                          // stop without leaving the channel
+await bot.leaveVoice(serverId)          // leave + clean up all peers
+
+vc.channelId   // string
+vc.serverId    // string
+vc.connected   // boolean
+vc.peerCount   // number of active WebRTC peer connections
+```
+
+#### `VoiceConnection` events
+
+```js
+vc.on('ready',     ()       => {})  // joined the channel
+vc.on('peerJoin',  (userId) => {})  // new user entered the channel
+vc.on('peerLeave', (userId) => {})  // user left the channel
+vc.on('finish',    ()       => {})  // audio file finished (non-looping)
+vc.on('error',     (err)    => {})  // WebRTC or audio error
+```
+
+#### Full example — `!joinvoice` command
+
+```js
+import { Client, BotStatus } from '@voltchat/wire'
+
+const bot = new Client({ prefix: '!' })
+
+bot.commands.add({
+  name: 'joinvoice',
+  aliases: ['jv'],
+  usage: '!joinvoice <channelId>',
+  execute: async (message, args) => {
+    if (!args[0]) return message.reply('Usage: `!joinvoice <channelId>`')
+
+    const vc = await bot.joinVoice(message.serverId, args[0])
+
+    vc.on('finish', () => console.log('Audio finished'))
+    vc.on('error',  (e) => console.error('Voice error:', e.message))
+
+    await message.reply(`Joined \`${args[0]}\`. Playing audio…`)
+    await vc.playFile('./audio.mp3')
+  }
+})
+
+bot.commands.add({
+  name: 'leavevoice',
+  aliases: ['lv'],
+  execute: async (message) => {
+    await bot.leaveVoice(message.serverId)
+    await message.reply('Left voice channel.')
+  }
+})
+
+bot.login(process.env.BOT_TOKEN, process.env.VOLT_SERVER)
+```
+
+---
+
+### Bot Status & Custom Status
+
+Bots support the same status system as human users. The status and custom status text are shown in the members sidebar in real time.
+
+```js
+import { BotStatus } from '@voltchat/wire'
+
+// Set status on ready
+bot.on('ready', async () => {
+  await bot.setStatus(BotStatus.ONLINE, 'Ready to help!')
+})
+
+// Change during operation
+await bot.setStatus(BotStatus.IDLE, 'Taking a break')
+await bot.setStatus(BotStatus.DND,  'Processing…')
+await bot.setStatus(BotStatus.ONLINE)          // clears customStatus
+await bot.setStatus(BotStatus.OFFLINE)         // bot appears offline
+
+// Via RestClient directly (REST-only, no instant socket push)
+await bot.rest.setStatus('idle', 'Taking a break')
+```
+
+`setStatus()` does two things simultaneously:
+1. Emits `bot:status-change` over the open WebSocket — the sidebar updates within milliseconds.
+2. Persists via `PUT /api/bots/api/status` — the status survives reconnects.
+
+#### Custom status notes
+
+- `customStatus` is a short string (≤ 128 chars recommended) shown under the bot's name.
+- Passing `null` or omitting it clears any existing custom status.
+- The status and custom status survive bot restarts (persisted in `bots.json`).
+
+---
+
 ### `RestClient`
 
 Direct HTTP access to every bot API endpoint. Available as `bot.rest` or standalone.
@@ -250,7 +390,8 @@ await rest.removeRole(serverId, userId, roleId)
 ```js
 await rest.registerCommands([{ name, description, usage }])
 await rest.setStatus('online')
-await rest.setStatus('idle', 'Taking a break')
+await rest.setStatus('idle', 'Taking a break')   // with customStatus
+await rest.setStatus('online', null)              // clear customStatus
 ```
 
 ---
@@ -345,8 +486,11 @@ Permissions.MESSAGES_SEND   // 'messages:send'
 Permissions.MEMBERS_MANAGE  // 'members:manage'
 // …etc
 
-GatewayEvents.MESSAGE_CREATE  // 'message:new'
-GatewayEvents.MEMBER_JOIN     // 'member:joined'
+GatewayEvents.MESSAGE_CREATE   // 'message:new'
+GatewayEvents.MEMBER_JOIN      // 'member:joined'
+GatewayEvents.USER_STATUS      // 'user:status'
+GatewayEvents.BOT_STATUS_CHANGE// 'bot:status-change'
+GatewayEvents.VOICE_JOIN       // 'voice:user-joined'
 // …etc
 ```
 
