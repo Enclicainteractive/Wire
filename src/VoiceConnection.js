@@ -52,18 +52,34 @@ class AudioPlayer extends EventEmitter {
    */
   constructor(audioSource, filePath, loop = false) {
     super()
-    this._source   = audioSource
-    this._filePath = filePath
-    this._loop     = loop
-    this._ffmpeg   = null
-    this._timer    = null
-    this._buf      = Buffer.alloc(0)
-    this._stopped  = false
+    this._source    = audioSource
+    this._filePath  = filePath
+    this._loop      = loop
+    this._ffmpeg    = null
+    this._timer     = null
+    this._buf       = Buffer.alloc(0)
+    this._stopped   = false
+    this._paused    = true   // hold the pump until unpaused (peers connected)
+    this._ffmpegDone = false // track whether ffmpeg has finished
   }
 
   start() {
-    this._stopped = false
+    this._stopped    = false
+    this._paused     = true
+    this._ffmpegDone = false
     this._spawnFfmpeg()
+  }
+
+  /**
+   * Resume pumping — called by VoiceConnection once a peer WebRTC connection
+   * reaches 'connected' state so audio isn't wasted before any peer is ready.
+   */
+  unpause() {
+    this._paused = false
+    // Start the pump timer if not already running
+    if (!this._timer && !this._stopped) {
+      this._timer = setInterval(() => this._pump(), FRAME_DURATION)
+    }
   }
 
   _spawnFfmpeg() {
@@ -73,6 +89,8 @@ class AudioPlayer extends EventEmitter {
       this.emit('error', new Error(`Audio file not found: ${this._filePath}`))
       return
     }
+
+    this._ffmpegDone = false
 
     // Decode the file to raw signed 16-bit LE PCM at 48 kHz mono
     this._ffmpeg = spawn('ffmpeg', [
@@ -91,47 +109,56 @@ class AudioPlayer extends EventEmitter {
     this._ffmpeg.stderr.on('data', () => {}) // suppress
 
     this._ffmpeg.on('close', (code) => {
-      this._ffmpeg = null
+      this._ffmpeg    = null
+      this._ffmpegDone = true
       if (!this._stopped && this._loop) {
-        // Drain remaining buffer then restart
-        setTimeout(() => this._spawnFfmpeg(), 0)
-      } else if (!this._stopped) {
-        // Let the pump drain the last buffer before emitting finish
-        setTimeout(() => this.emit('finish'), FRAME_DURATION * 2)
+        // Wait for the buffer to drain before re-encoding (avoids unbounded
+        // memory growth).  Check every 20 ms; the paused-state check is
+        // intentionally absent so restart works even if all peers left.
+        const drain = setInterval(() => {
+          if (this._stopped) { clearInterval(drain); return }
+          if (this._buf.length < FRAME_BYTES) {
+            clearInterval(drain)
+            this._ffmpegDone = false
+            this._spawnFfmpeg()
+          }
+        }, FRAME_DURATION)
       }
+      // Non-loop finish is handled in _pump once the buffer is drained
     })
 
     this._ffmpeg.on('error', (err) => {
       this.emit('error', err)
     })
-
-    // Start the 20ms pump if not already running
-    if (!this._timer) {
-      this._timer = setInterval(() => this._pump(), FRAME_DURATION)
-    }
   }
 
   _pump() {
-    if (this._buf.length < FRAME_BYTES) return
+    if (this._stopped || this._paused) return
 
-    const frame   = this._buf.slice(0, FRAME_BYTES)
-    this._buf     = this._buf.slice(FRAME_BYTES)
-    const samples = new Int16Array(
-      frame.buffer,
-      frame.byteOffset,
-      frame.byteLength / 2
-    )
+    if (this._buf.length >= FRAME_BYTES) {
+      const frame   = this._buf.slice(0, FRAME_BYTES)
+      this._buf     = this._buf.slice(FRAME_BYTES)
+      const samples = new Int16Array(
+        frame.buffer,
+        frame.byteOffset,
+        frame.byteLength / 2
+      )
 
-    try {
-      this._source.onData({
-        samples,
-        sampleRate:     SAMPLE_RATE,
-        bitsPerSample:  BITS,
-        channelCount:   CHANNELS,
-        numberOfFrames: FRAME_SAMPLES,
-      })
-    } catch {
-      // RTCAudioSource may be gone if peer disconnected mid-play
+      try {
+        this._source.onData({
+          samples,
+          sampleRate:     SAMPLE_RATE,
+          bitsPerSample:  BITS,
+          channelCount:   CHANNELS,
+          numberOfFrames: FRAME_SAMPLES,
+        })
+      } catch {
+        // RTCAudioSource may be gone if peer disconnected mid-play
+      }
+    } else if (this._ffmpegDone && !this._loop && !this._stopped) {
+      // Buffer exhausted and ffmpeg is done — audio finished
+      this.stop()
+      this.emit('finish')
     }
   }
 
@@ -261,10 +288,16 @@ export class VoiceConnection extends EventEmitter {
   /**
    * Stream an audio file to all peers in the channel.
    * Supports any format ffmpeg can decode (mp3, ogg, wav, flac, …).
+   *
+   * ffmpeg starts decoding immediately so the buffer is pre-filled, but the
+   * PCM pump is held until at least one peer WebRTC connection reaches
+   * 'connected' state.  This prevents audio from being silently discarded
+   * before the WebRTC handshake completes.
+   *
    * @param {string}  filePath  Path to the audio file
    * @param {object}  [opts]
    * @param {boolean} [opts.loop=false]   Loop the file until stop() is called
-   * @returns {Promise<void>}  Resolves when playback starts
+   * @returns {Promise<void>}  Resolves when playback starts (buffer filling)
    */
   playFile(filePath, { loop = false } = {}) {
     this.stopAudio()
@@ -283,8 +316,32 @@ export class VoiceConnection extends EventEmitter {
     })
 
     this._player.start()
-    this._log('Playing:', resolved)
+    this._log('Buffering audio (waiting for peer connection):', resolved)
+
+    // If there's already a connected peer, start pumping immediately
+    if (this._hasConnectedPeer()) {
+      this._player.unpause()
+      this._log('Peer already connected — starting pump immediately')
+    }
+    // Otherwise the pump will be unpaused by _onPeerConnected()
+
     return Promise.resolve()
+  }
+
+  /** Returns true if at least one RTCPeerConnection is in 'connected' state. */
+  _hasConnectedPeer() {
+    for (const pc of this._peers.values()) {
+      if (pc.connectionState === 'connected') return true
+    }
+    return false
+  }
+
+  /** Called when a peer connection transitions to 'connected'. */
+  _onPeerConnected() {
+    if (this._player && this._player._paused) {
+      this._log('Peer connected — unpausing audio pump')
+      this._player.unpause()
+    }
   }
 
   /** Stop any currently playing audio without leaving the channel. */
@@ -352,6 +409,9 @@ export class VoiceConnection extends EventEmitter {
 
     pc.onconnectionstatechange = () => {
       this._log(`Peer ${targetUserId} connection state: ${pc.connectionState}`)
+      if (pc.connectionState === 'connected') {
+        this._onPeerConnected()
+      }
       if (pc.connectionState === 'failed' || pc.connectionState === 'closed') {
         this._destroyPeer(targetUserId)
       }
