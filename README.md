@@ -1,6 +1,6 @@
 # @voltchat/wire
 
-The official bot framework for VoltChat. Build bots that respond to messages, run commands, and automate your servers.
+The official bot framework for VoltChat. Build bots that respond to messages, run commands, moderate servers, and react to every platform event.
 
 ## Install
 
@@ -8,27 +8,20 @@ The official bot framework for VoltChat. Build bots that respond to messages, ru
 npm install @voltchat/wire
 ```
 
+Requires Node.js ≥ 18. Pure ES modules (`"type": "module"`).
+
 ## Quick Start
 
-```javascript
+```js
 import { Client } from '@voltchat/wire'
 
 const bot = new Client({ prefix: '!' })
 
 bot.commands.add({
   name: 'ping',
-  description: 'Check bot latency',
+  description: 'Check latency',
   execute: async (message) => {
-    await message.reply(`Pong! ${bot.uptime}ms uptime`)
-  }
-})
-
-bot.commands.add({
-  name: 'hello',
-  description: 'Say hello',
-  execute: async (message, args) => {
-    const name = args[0] || message.username
-    await message.reply(`Hello, ${name}!`)
+    await message.reply(`Pong! Uptime: ${bot.uptime}ms`)
   }
 })
 
@@ -36,63 +29,247 @@ bot.on('ready', (info) => {
   console.log(`${info.name} is online in ${info.servers.length} servers`)
 })
 
-bot.login('vbot_your_token_here', 'https://your-volt-server.com')
+bot.login('vbot_your_token', 'https://your-volt-server.com')
 ```
 
-## Features
+See [`examples/wilmer/`](examples/wilmer/) for a complete, production-style example bot.
 
-- **WebSocket client** with auto-reconnect and server room joining
-- **Command registry** with prefix parsing, aliases, cooldowns, and error handling
-- **REST client** for sending messages, managing commands, and reading members
-- **Embed builder** for rich message formatting
-- **Webhook server** for HTTP-callback bots with signature verification
-- **Event-driven** architecture with familiar `on`/`once`/`emit` API
+---
 
-## API
+## API Reference
 
 ### `Client`
 
-The main bot client. Connects via WebSocket and provides the command framework.
+The main bot client. Connects to the VoltChat gateway via WebSocket and exposes the full API.
 
-```javascript
+```js
 const bot = new Client({
-  prefix: '!',         // Command prefix (default: '!')
-  debug: true,         // Enable debug logging
-  reconnect: true,     // Auto-reconnect (default: true)
-  reconnectDelay: 5000 // Reconnect delay in ms
+  prefix: '!',          // Command prefix (default: '!')
+  debug: true,          // Enable [Wire] console logs
+  reconnect: true,      // Auto-reconnect on disconnect (default: true)
+  reconnectDelay: 5000, // Delay between reconnect attempts in ms
+  userToken: null,      // Override the socket auth token (advanced)
+  serverUrl: null,      // Can be set here instead of login()
 })
 
 await bot.login(token, serverUrl)
 ```
 
-**Events:** `ready`, `message`, `messageUpdate`, `messageDelete`, `memberJoin`, `memberLeave`, `reaction`, `channelCreate`, `channelUpdate`, `channelDelete`, `serverUpdate`, `typingStart`, `disconnect`, `reconnect`, `error`
+#### Properties
 
-### `CommandRegistry`
+| Property | Type | Description |
+|---|---|---|
+| `bot` | `object` | Bot profile (id, name, servers, permissions) |
+| `commands` | `CommandRegistry` | Registered command handler |
+| `servers` | `Map` | Cache of server data, keyed by server ID |
+| `channels` | `Map` | Cache of channel data, keyed by channel ID |
+| `members` | `Map` | Cache of member data, keyed by `serverId:userId` |
+| `uptime` | `number` | Milliseconds since the bot became ready |
+| `isReady` | `boolean` | Whether the socket is connected and ready |
 
-```javascript
-bot.commands.add({
-  name: 'ban',
-  description: 'Ban a user',
-  aliases: ['b'],
-  cooldown: 10,  // seconds
-  execute: async (message, args, ctx) => {
-    await message.reply(`Banned ${args[0]}`)
-  }
-})
+#### Methods
 
-bot.commands.onError((err, message, cmd) => {
-  message.reply(`Error running ${cmd.name}: ${err.message}`)
+```js
+// Send a message
+await bot.send(channelId, 'Hello!', { embeds: [...] })
+
+// Status — 'online' | 'idle' | 'dnd' | 'offline'
+await bot.setStatus('idle', 'Taking a break')
+
+// Typing indicator
+await bot.startTyping(channelId)             // one-shot
+await bot.startTyping(channelId, true)       // continuous until stopTyping()
+bot.stopTyping(channelId)
+
+// Fetch & cache server data
+const members  = await bot.fetchMembers(serverId)
+const channels = await bot.fetchChannels(serverId)
+const server   = await bot.fetchServer(serverId)
+
+// Graceful shutdown
+bot.destroy()
+```
+
+#### Events
+
+```js
+bot.on('ready',          (botInfo) => {})
+bot.on('message',        (message) => {})   // Message object
+bot.on('messageEdit',    (message) => {})
+bot.on('messageDelete',  (data)    => {})
+bot.on('messagePinned',  (data)    => {})
+bot.on('messageUnpinned',(data)    => {})
+bot.on('reaction',       (data)    => {})   // all reaction events
+bot.on('reactionAdd',    (data)    => {})
+bot.on('reactionRemove', (data)    => {})
+bot.on('memberJoin',     (data)    => {})
+bot.on('memberLeave',    (data)    => {})
+bot.on('memberOffline',  (data)    => {})
+bot.on('channelCreate',  (data)    => {})
+bot.on('channelUpdate',  (data)    => {})
+bot.on('channelDelete',  (data)    => {})
+bot.on('serverUpdate',   (data)    => {})
+bot.on('typingStart',    (data)    => {})
+bot.on('voiceJoin',      (data)    => {})
+bot.on('voiceLeave',     (data)    => {})
+bot.on('voiceUpdate',    (data)    => {})
+bot.on('userStatus',     (data)    => {})
+bot.on('disconnect',     (reason)  => {})
+bot.on('reconnect',      ()        => {})
+bot.on('error',          (err)     => {})
+```
+
+---
+
+### `Message`
+
+Received from `message` and `messageEdit` events. Wraps the raw data and provides action methods.
+
+```js
+bot.on('message', async (message) => {
+  message.id          // string
+  message.channelId   // string
+  message.serverId    // string | null
+  message.userId      // string
+  message.username    // string
+  message.content     // string
+  message.embeds      // array
+  message.attachments // array
+  message.bot         // boolean
+  message.pinned      // boolean
+  message.replyTo     // string | null
+  message.timestamp   // Date
+  message.author      // { id, username, avatar, bot }
+  message.age         // ms since sent
+  message.inServer    // boolean
+  message.hasEmbeds   // boolean
+  message.hasAttachments // boolean
+
+  // Actions
+  await message.reply('text')
+  await message.reply({ content: 'text', embeds: [...] })
+  await message.edit('new content')
+  await message.delete()
+  await message.pin()
+  await message.unpin()
+  await message.react('👋')
+  await message.unreact('👋')
+  await message.startTyping()
+
+  // Helpers
+  message.parseCommand('!')  // → { name, args, raw } | null
+  message.mentions(userId)   // boolean
 })
 ```
 
+---
+
+### `CommandRegistry`
+
+```js
+bot.commands.add({
+  name: 'ban',
+  description: 'Ban a user',
+  usage: '!ban <userId> [reason]',
+  aliases: ['b'],
+  cooldown: 10,         // seconds per user
+  permissions: ['admin'],
+  execute: async (message, args, ctx) => {
+    // ctx = { command, prefix, raw }
+    await message.reply(`Banning ${args[0]}`)
+  }
+})
+
+// Remove a command
+bot.commands.remove('ban')
+
+// Global command error handler
+bot.commands.onError(async (err, message, cmd) => {
+  await message.reply(`Error in !${cmd.name}: ${err.message}`)
+})
+
+// Array of { name, description, usage } for display / API sync
+bot.commands.toArray()
+```
+
+---
+
+### `RestClient`
+
+Direct HTTP access to every bot API endpoint. Available as `bot.rest` or standalone.
+
+```js
+import { RestClient } from '@voltchat/wire'
+const rest = new RestClient('https://your-server.com', 'vbot_token')
+```
+
+#### Bot identity
+```js
+await rest.getMe()
+await rest.getGateway()
+```
+
+#### Messages
+```js
+await rest.sendMessage(channelId, 'Hello!')
+await rest.sendMessage(channelId, { content: 'Hi', embeds: [...] })
+await rest.editMessage(channelId, messageId, 'Edited content')
+await rest.deleteMessage(channelId, messageId)
+await rest.pinMessage(channelId, messageId)
+await rest.unpinMessage(channelId, messageId)
+```
+
+#### Reactions
+```js
+await rest.addReaction(channelId, messageId, '👍')
+await rest.removeReaction(channelId, messageId, '👍')
+```
+
+#### Channels
+```js
+await rest.getChannels(serverId)
+await rest.getChannel(channelId)
+await rest.sendTyping(channelId)
+```
+
+#### Servers & members
+```js
+await rest.getServer(serverId)
+await rest.getServerMembers(serverId)
+await rest.getServerMember(serverId, userId)
+await rest.kickMember(serverId, userId, 'reason')
+await rest.banMember(serverId, userId, 'reason')
+await rest.unbanMember(serverId, userId)
+await rest.getBans(serverId)
+await rest.getRoles(serverId)
+await rest.addRole(serverId, userId, roleId)
+await rest.removeRole(serverId, userId, roleId)
+```
+
+#### Commands & status
+```js
+await rest.registerCommands([{ name, description, usage }])
+await rest.setStatus('online')
+await rest.setStatus('idle', 'Taking a break')
+```
+
+---
+
 ### `Embed`
 
-```javascript
+Fluent builder for rich embeds.
+
+```js
 import { Embed } from '@voltchat/wire'
 
 const embed = new Embed()
   .setTitle('Server Stats')
+  .setDescription('Current snapshot')
   .setColor('#5865f2')
+  .setURL('https://example.com')
+  .setAuthor('Wilmer', avatarUrl)
+  .setThumbnail(iconUrl)
+  .setImage(bannerUrl)
   .addField('Members', '42', true)
   .addField('Channels', '8', true)
   .setFooter('Powered by Wire')
@@ -101,26 +278,37 @@ const embed = new Embed()
 await bot.send(channelId, '', { embeds: [embed.toJSON()] })
 ```
 
-### `RestClient`
+---
 
-Use the REST API without a WebSocket connection.
+### `Collection`
 
-```javascript
-import { RestClient } from '@voltchat/wire'
+A `Map` subclass with Array-like helpers. Used for `bot.servers`, `bot.channels`, `bot.members`.
 
-const rest = new RestClient('https://your-server.com', 'vbot_token')
-await rest.sendMessage(channelId, 'Hello!')
-await rest.setStatus('online')
-const members = await rest.getServerMembers(serverId)
+```js
+import { Collection } from '@voltchat/wire'
+
+const c = new Collection()
+c.set('a', { id: 'a', name: 'general' })
+
+c.find(v => v.name === 'general')
+c.filter(v => v.name.startsWith('bot'))
+c.map(v => v.name)
+c.some(v => v.id === 'a')
+c.every(v => v.id !== null)
+c.reduce((acc, v) => acc + 1, 0)
+c.toArray()
+c.first()
+c.last()
+c.random()
 ```
+
+---
 
 ### `WebhookServer`
 
 Receive events via HTTP instead of WebSocket.
 
-GitHub: [Enclicainteractive/Wire](https://github.com/Enclicainteractive/Wire)
-
-```javascript
+```js
 import { WebhookServer } from '@voltchat/wire'
 
 const server = new WebhookServer({
@@ -130,18 +318,40 @@ const server = new WebhookServer({
 })
 
 server.on('MESSAGE_CREATE', (data) => {
-  console.log('New message:', data.message.content)
+  console.log('New message:', data.content)
+})
+
+// Wildcard — all events
+server.on('*', (eventName, data) => {
+  console.log(eventName, data)
 })
 
 await server.start()
 ```
 
-## Constants
+---
 
-```javascript
-import { Intents, Permissions, GatewayEvents, BotStatus } from '@voltchat/wire'
+### Constants
+
+```js
+import { GatewayEvents, Intents, Permissions, BotStatus } from '@voltchat/wire'
+
+BotStatus.ONLINE    // 'online'
+BotStatus.IDLE      // 'idle'
+BotStatus.DND       // 'dnd'
+BotStatus.OFFLINE   // 'offline'
+
+Permissions.MESSAGES_SEND   // 'messages:send'
+Permissions.MEMBERS_MANAGE  // 'members:manage'
+// …etc
+
+GatewayEvents.MESSAGE_CREATE  // 'message:new'
+GatewayEvents.MEMBER_JOIN     // 'member:joined'
+// …etc
 ```
+
+---
 
 ## License
 
-MIT
+MIT — [github.com/Enclicainteractive/Wire](https://github.com/Enclicainteractive/Wire)

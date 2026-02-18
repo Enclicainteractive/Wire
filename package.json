@@ -1,14 +1,17 @@
 {
   "name": "@voltchat/wire",
-  "version": "1.0.3",
+  "version": "1.1.0",
   "description": "The official VoltChat bot framework. Build bots that respond to messages, run commands, and automate your servers.",
   "main": "src/index.js",
   "type": "module",
   "exports": {
-    ".": "./src/index.js",
-    "./client": "./src/Client.js",
-    "./rest": "./src/RestClient.js",
-    "./commands": "./src/CommandRegistry.js"
+    ".":             "./src/index.js",
+    "./client":      "./src/Client.js",
+    "./rest":        "./src/RestClient.js",
+    "./commands":    "./src/CommandRegistry.js",
+    "./collection":  "./src/Collection.js",
+    "./embed":       "./src/Embed.js",
+    "./webhook":     "./src/WebhookServer.js"
   },
   "keywords": [
     "voltchat",

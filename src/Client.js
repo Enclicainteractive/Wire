@@ -8,33 +8,65 @@ import { GatewayEvents, BotStatus } from './constants.js'
 export class Client extends EventEmitter {
   constructor(options = {}) {
     super()
-    this.token = null
-    this.userToken = options.userToken || null
-    this.serverUrl = options.serverUrl || null
-    this.rest = null
-    this.socket = null
-    this.bot = null
-    this.commands = new CommandRegistry(options.prefix || '!')
-    this.readyAt = null
-    this._reconnect = options.reconnect !== false
-    this._reconnectDelay = options.reconnectDelay || 5000
-    this._debug = options.debug || false
+    this.token      = null
+    this.userToken  = options.userToken  || null
+    this.serverUrl  = options.serverUrl  || null
+    this.rest       = null
+    this.socket     = null
+    this.bot        = null
+    this.commands   = new CommandRegistry(options.prefix || '!')
+    this.readyAt    = null
+
+    // Caches — plain Maps, populated from gateway events
+    this.servers    = new Map()   // serverId  -> server data
+    this.channels   = new Map()   // channelId -> channel data
+    this.members    = new Map()   // `${serverId}:${userId}` -> member data
+
+    this._reconnect       = options.reconnect !== false
+    this._reconnectDelay  = options.reconnectDelay || 5000
+    this._debug           = options.debug || false
+    this._typingTimers    = new Map()   // channelId -> timer handle
   }
+
+  // ---------------------------------------------------------------------------
+  // Internal helpers
+  // ---------------------------------------------------------------------------
 
   _log(...args) {
     if (this._debug) console.log('[Wire]', ...args)
   }
 
+  _normalizeGatewayUrl(url) {
+    if (typeof url !== 'string') return url
+    // Convert raw WebSocket schemes to HTTP(S) — socket.io needs HTTP(S).
+    url = url.replace(/^wss:\/\//i, 'https://').replace(/^ws:\/\//i, 'http://')
+    // If the user supplied an https:// server URL but the gateway returned
+    // http://, upgrade it (server-side misconfiguration behind a proxy).
+    if (this.serverUrl?.startsWith('https://') && url.startsWith('http://')) {
+      url = 'https://' + url.slice('http://'.length)
+    }
+    return url
+  }
+
+  // ---------------------------------------------------------------------------
+  // Login / connect
+  // ---------------------------------------------------------------------------
+
+  /**
+   * Authenticate and open the WebSocket gateway connection.
+   * @param {string} token     Bot token (vbot_…)
+   * @param {string} serverUrl Base URL of the VoltChat server.
+   * @returns {Promise<object>} Resolves with the bot's profile when ready.
+   */
   async login(token, serverUrl) {
-    if (token) this.token = token
+    if (token)     this.token     = token
     if (serverUrl) this.serverUrl = serverUrl
 
-    if (!this.token) throw new Error('Bot token is required. Call client.login(token, serverUrl)')
-    if (!this.serverUrl) throw new Error('Server URL is required. Call client.login(token, serverUrl)')
+    if (!this.token)     throw new Error('Bot token is required.')
+    if (!this.serverUrl) throw new Error('Server URL is required.')
 
     this.rest = new RestClient(this.serverUrl, this.token)
 
-    // Fetch gateway info and bot identity
     const [gateway, me] = await Promise.all([
       this.rest.getGateway(),
       this.rest.getMe()
@@ -44,43 +76,13 @@ export class Client extends EventEmitter {
     this._log('Authenticated as', me.name, `(${me.id})`)
     this._log('Gateway URL from server:', gateway.url || '(none, using serverUrl)')
 
-    // Connect via WebSocket. Prefer the URL returned by the gateway endpoint;
-    // fall back to the serverUrl passed to login().
-    const gatewayUrl = gateway.url || this.serverUrl
-    return this._connectGateway(gatewayUrl)
-  }
-
-  _normalizeGatewayUrl(url) {
-    // socket.io-client requires an http:// or https:// base URL — it handles
-    // the WebSocket upgrade internally. Convert raw ws(s):// URLs first.
-    if (typeof url !== 'string') return url
-    url = url.replace(/^wss:\/\//i, 'https://').replace(/^ws:\/\//i, 'http://')
-
-    // The gateway endpoint may return an http:// URL even when the server is
-    // HTTPS-only (a common server-side misconfiguration). If the serverUrl the
-    // user provided is https://, honour that and upgrade the gateway URL too so
-    // engine.io uses wss:// and avoids the HTTP 301 redirect that the ws
-    // library cannot follow during a WebSocket upgrade.
-    if (this.serverUrl?.startsWith('https://') && url.startsWith('http://')) {
-      url = 'https://' + url.slice('http://'.length)
-    }
-
-    return url
+    return this._connectGateway(gateway.url || this.serverUrl)
   }
 
   _connectGateway(rawUrl) {
     const url = this._normalizeGatewayUrl(rawUrl)
-    if (url !== rawUrl) {
-      this._log(`Gateway URL normalized: ${rawUrl} -> ${url}`)
-    }
+    if (url !== rawUrl) this._log(`Gateway URL normalized: ${rawUrl} -> ${url}`)
 
-    // Derive whether TLS should be forced from the final URL scheme.
-    // This matters because engine.io-client builds the WebSocket URL
-    // independently from the base URL scheme. If the server returns an
-    // HTTP 301 redirect (http → https), the ws:// upgrade request is
-    // rejected with "Unexpected server response: 301" because the ws
-    // library does not follow redirects. Setting `secure: true` forces
-    // engine.io to always use wss:// regardless of polling results.
     const secure = url.startsWith('https://')
 
     return new Promise((resolve, reject) => {
@@ -96,6 +98,8 @@ export class Client extends EventEmitter {
         secure
       })
 
+      // -- Connection lifecycle --
+
       this.socket.on('connect', () => {
         this._log('WebSocket connected (transport:', this.socket.io.engine.transport.name + ')')
         this.socket.emit('bot:connect', { botToken: this.token })
@@ -106,14 +110,14 @@ export class Client extends EventEmitter {
         this.bot = { ...this.bot, ...data }
         this._log('Ready! Serving', data.servers?.length || 0, 'servers')
 
-        // Auto-join server rooms
+        // Join server rooms
         if (data.servers) {
           for (const serverId of data.servers) {
             this.socket.emit('server:join', serverId)
           }
         }
 
-        // Sync registered commands
+        // Sync commands
         if (this.commands.commands.size > 0) {
           this.rest.registerCommands(this.commands.toArray()).catch(err => {
             this._log('Failed to sync commands:', err.message)
@@ -125,11 +129,16 @@ export class Client extends EventEmitter {
         resolve(this.bot)
       })
 
+      this.socket.on(GatewayEvents.BOT_ERROR, (data) => {
+        this._log('Bot error from server:', data?.error)
+        this.emit('botError', data)
+      })
+
+      // -- Messages --
+
       this.socket.on(GatewayEvents.MESSAGE_CREATE, (data) => {
         const message = new Message(data, this)
-        // Skip own messages
-        if (message.userId === this.bot?.id) return
-
+        if (message.userId === this.bot?.id) return   // skip own messages
         this.emit('message', message)
         this.commands.handle(message)
       })
@@ -138,44 +147,106 @@ export class Client extends EventEmitter {
         this.emit('messageUpdate', data)
       })
 
+      this.socket.on(GatewayEvents.MESSAGE_EDITED, (data) => {
+        this.emit('messageEdit', new Message(data, this))
+      })
+
       this.socket.on(GatewayEvents.MESSAGE_DELETE, (data) => {
         this.emit('messageDelete', data)
       })
 
+      this.socket.on(GatewayEvents.MESSAGE_PINNED, (data) => {
+        this.emit('messagePinned', data)
+      })
+
+      this.socket.on(GatewayEvents.MESSAGE_UNPINNED, (data) => {
+        this.emit('messageUnpinned', data)
+      })
+
+      // -- Reactions --
+
+      this.socket.on(GatewayEvents.REACTION_UPDATE, (data) => {
+        // Emit granular events based on the action field as well as the raw one
+        this.emit('reaction', data)
+        if (data.action === 'add')    this.emit('reactionAdd', data)
+        if (data.action === 'remove') this.emit('reactionRemove', data)
+      })
+
+      // -- Members --
+
       this.socket.on(GatewayEvents.MEMBER_JOIN, (data) => {
+        if (data.serverId && data.id) {
+          this.members.set(`${data.serverId}:${data.id}`, data)
+        }
         this.emit('memberJoin', data)
       })
 
       this.socket.on(GatewayEvents.MEMBER_LEAVE, (data) => {
+        if (data.serverId && data.id) {
+          this.members.delete(`${data.serverId}:${data.id}`)
+        }
         this.emit('memberLeave', data)
       })
 
-      this.socket.on(GatewayEvents.REACTION_ADD, (data) => {
-        this.emit('reaction', data)
+      this.socket.on(GatewayEvents.MEMBER_OFFLINE, (data) => {
+        this.emit('memberOffline', data)
       })
 
+      // -- Channels --
+
       this.socket.on(GatewayEvents.CHANNEL_CREATE, (data) => {
+        if (data.id) this.channels.set(data.id, data)
         this.emit('channelCreate', data)
       })
 
       this.socket.on(GatewayEvents.CHANNEL_UPDATE, (data) => {
+        if (data.id) this.channels.set(data.id, data)
         this.emit('channelUpdate', data)
       })
 
       this.socket.on(GatewayEvents.CHANNEL_DELETE, (data) => {
+        if (data.channelId) this.channels.delete(data.channelId)
         this.emit('channelDelete', data)
       })
 
+      // -- Servers --
+
       this.socket.on(GatewayEvents.SERVER_UPDATE, (data) => {
+        if (data.id) this.servers.set(data.id, data)
         this.emit('serverUpdate', data)
       })
+
+      // -- Typing --
 
       this.socket.on(GatewayEvents.TYPING_START, (data) => {
         this.emit('typingStart', data)
       })
 
+      // -- Voice --
+
+      this.socket.on(GatewayEvents.VOICE_JOIN, (data) => {
+        this.emit('voiceJoin', data)
+      })
+
+      this.socket.on(GatewayEvents.VOICE_LEAVE, (data) => {
+        this.emit('voiceLeave', data)
+      })
+
+      this.socket.on(GatewayEvents.VOICE_USER_UPDATE, (data) => {
+        this.emit('voiceUpdate', data)
+      })
+
+      // -- Presence --
+
+      this.socket.on(GatewayEvents.USER_STATUS, (data) => {
+        this.emit('userStatus', data)
+      })
+
+      // -- Connection lifecycle --
+
       this.socket.on('disconnect', (reason) => {
         this._log('Disconnected:', reason)
+        this._clearAllTypingTimers()
         this.emit('disconnect', reason)
       })
 
@@ -185,22 +256,19 @@ export class Client extends EventEmitter {
       })
 
       this.socket.on('connect_error', (err) => {
-        // Attach full diagnostic context to the error before emitting/rejecting
-        // so callers can log or inspect the real underlying failure.
         const detail = [
           `message: ${err.message}`,
           err.description ? `description: ${err.description}` : null,
-          err.type       ? `type: ${err.type}`                : null,
-          err.context    ? `context: ${JSON.stringify(err.context)}` : null,
-          err.cause      ? `cause: ${err.cause?.message ?? err.cause}` : null,
+          err.type        ? `type: ${err.type}`                : null,
+          err.context     ? `context: ${JSON.stringify(err.context)}` : null,
+          err.cause       ? `cause: ${err.cause?.message ?? err.cause}` : null,
         ].filter(Boolean).join(' | ')
 
         this._log(`Connection error [${url}] — ${detail}`)
         if (this._debug && err.stack) console.log('[Wire] Stack:', err.stack)
 
-        // Enrich the error object so upstream handlers have full detail
         err.gatewayUrl = url
-        err.detail = detail
+        err.detail     = detail
 
         this.emit('error', err)
         if (!this.readyAt) reject(err)
@@ -208,20 +276,113 @@ export class Client extends EventEmitter {
     })
   }
 
+  // ---------------------------------------------------------------------------
+  // Convenience methods
+  // ---------------------------------------------------------------------------
+
+  /**
+   * Send a message to a channel.
+   */
   async send(channelId, content, options = {}) {
     return this.rest.sendMessage(channelId, content, options)
   }
 
-  async setStatus(status) {
-    return this.rest.setStatus(status)
+  /**
+   * Send a typing indicator in a channel.
+   * Optionally keep it going every 8 s until stopTyping() is called.
+   * @param {string}  channelId
+   * @param {boolean} [continuous=false]
+   */
+  async startTyping(channelId, continuous = false) {
+    await this.rest.sendTyping(channelId).catch(() => {})
+    if (continuous && !this._typingTimers.has(channelId)) {
+      const timer = setInterval(() => {
+        this.rest.sendTyping(channelId).catch(() => {})
+      }, 8000)
+      this._typingTimers.set(channelId, timer)
+    }
   }
 
+  /**
+   * Stop the continuous typing indicator for a channel.
+   * @param {string} channelId
+   */
+  stopTyping(channelId) {
+    const timer = this._typingTimers.get(channelId)
+    if (timer) {
+      clearInterval(timer)
+      this._typingTimers.delete(channelId)
+    }
+  }
+
+  _clearAllTypingTimers() {
+    for (const timer of this._typingTimers.values()) clearInterval(timer)
+    this._typingTimers.clear()
+  }
+
+  /**
+   * Set the bot's status.
+   * @param {'online'|'idle'|'dnd'|'offline'} status
+   * @param {string} [customStatus]
+   */
+  async setStatus(status, customStatus) {
+    return this.rest.setStatus(status, customStatus)
+  }
+
+  /**
+   * Fetch and cache all members of a server.
+   * @param {string} serverId
+   */
+  async fetchMembers(serverId) {
+    const members = await this.rest.getServerMembers(serverId)
+    for (const m of members) {
+      this.members.set(`${serverId}:${m.id}`, m)
+    }
+    return members
+  }
+
+  /**
+   * Fetch and cache a server's channels.
+   * @param {string} serverId
+   */
+  async fetchChannels(serverId) {
+    const channels = await this.rest.getChannels(serverId)
+    for (const c of (Array.isArray(channels) ? channels : [])) {
+      this.channels.set(c.id, c)
+    }
+    return channels
+  }
+
+  /**
+   * Fetch server info and cache it.
+   * @param {string} serverId
+   */
+  async fetchServer(serverId) {
+    const server = await this.rest.getServer(serverId)
+    if (server?.id) this.servers.set(server.id, server)
+    return server
+  }
+
+  // ---------------------------------------------------------------------------
+  // Lifecycle
+  // ---------------------------------------------------------------------------
+
+  /** Milliseconds since the bot became ready. */
   get uptime() {
     if (!this.readyAt) return 0
     return Date.now() - this.readyAt.getTime()
   }
 
+  /** Whether the bot is currently connected and ready. */
+  get isReady() {
+    return this.readyAt !== null && this.socket?.connected === true
+  }
+
+  /**
+   * Gracefully shut down — set offline status, disconnect socket, clean up.
+   */
   destroy() {
+    this._clearAllTypingTimers()
     this.rest?.setStatus(BotStatus.OFFLINE).catch(() => {})
     this.socket?.disconnect()
     this.removeAllListeners()
