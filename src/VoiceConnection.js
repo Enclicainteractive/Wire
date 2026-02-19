@@ -304,9 +304,27 @@ export class VoiceConnection extends EventEmitter {
     this._onOffer         = this._onOffer.bind(this)
     this._onAnswer        = this._onAnswer.bind(this)
     this._onIceCandidate  = this._onIceCandidate.bind(this)
+    this._onForceReconnect = this._onForceReconnect.bind(this)
   }
 
   _log(...args) { if (this._debug) console.log('[Wire/Voice]', ...args) }
+
+  // ---------------------------------------------------------------------------
+  // Peer state reporting for consensus monitoring
+  // ---------------------------------------------------------------------------
+
+  /**
+   * Report peer connection state to server for consensus tracking
+   */
+  _reportPeerState(peerId, state) {
+    if (!this._socket?.connected) return
+    this._socket.emit('voice:peer-state-report', {
+      channelId: this._channelId,
+      targetPeerId: peerId,
+      state: state,
+      timestamp: Date.now()
+    })
+  }
 
   // ---------------------------------------------------------------------------
   // Tiered connection management for scaling to 100+ peers
@@ -575,6 +593,10 @@ export class VoiceConnection extends EventEmitter {
 
     pc.onconnectionstatechange = () => {
       this._log(`Peer ${ps.peerId} connection state: ${pc.connectionState}`)
+      
+      // Report peer state to server for consensus monitoring
+      this._reportPeerState(ps.peerId, pc.connectionState)
+      
       if (pc.connectionState === 'connected') {
         if (!ps._peerJoinEmitted) {
           ps._peerJoinEmitted = true
@@ -668,6 +690,7 @@ export class VoiceConnection extends EventEmitter {
     this._socket.on('voice:offer',         this._onOffer)
     this._socket.on('voice:answer',        this._onAnswer)
     this._socket.on('voice:ice-candidate', this._onIceCandidate)
+    this._socket.on('voice:force-reconnect', this._onForceReconnect)
   }
 
   _deregisterSocketListeners() {
@@ -677,6 +700,7 @@ export class VoiceConnection extends EventEmitter {
     this._socket.off('voice:offer',         this._onOffer)
     this._socket.off('voice:answer',        this._onAnswer)
     this._socket.off('voice:ice-candidate', this._onIceCandidate)
+    this._socket.off('voice:force-reconnect', this._onForceReconnect)
   }
 
   // ---------------------------------------------------------------------------
@@ -789,6 +813,37 @@ export class VoiceConnection extends EventEmitter {
     this._log('User left voice:', userId)
     this._destroyPeerState(userId)
     this.emit('peerLeave', userId)
+  }
+
+  /**
+   * Handle force-reconnect command from server (consensus broken)
+   */
+  _onForceReconnect(data) {
+    const { channelId, reason, targetPeer, failurePercent, timestamp } = data
+    if (channelId !== this._channelId) return
+    
+    this._log(`Force-reconnect received: ${reason}, target=${targetPeer}, failures=${failurePercent}%`)
+    
+    if (targetPeer === this._botId) {
+      // I am the problematic peer - perform full reconnect
+      this._log('I am the target peer - performing full reconnect in 1s')
+      setTimeout(() => {
+        this.leave()
+        setTimeout(() => this.join(), 500)
+      }, 1000)
+    } else if (targetPeer === 'all' || targetPeer === '*') {
+      // Everyone reconnect
+      this._log('Full channel reconnect requested - performing full reconnect in 1s')
+      setTimeout(() => {
+        this.leave()
+        setTimeout(() => this.join(), 500)
+      }, 1000)
+    } else {
+      // Reconnect to specific peer only
+      this._log(`Reconnecting to specific peer ${targetPeer}`)
+      this._destroyPeerState(targetPeer)
+      this._queueConnection(targetPeer)
+    }
   }
 
   /**
