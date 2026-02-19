@@ -4,8 +4,6 @@ import { spawn } from 'child_process'
 import path from 'path'
 import fs from 'fs'
 
-// @roamhq/wrtc is a native optional dependency — load via CJS require so that
-// bots which don't use voice don't need it installed.
 const require = createRequire(import.meta.url)
 
 function loadWrtc() {
@@ -18,11 +16,6 @@ function loadWrtc() {
   }
 }
 
-// ---------------------------------------------------------------------------
-// ICE server configuration
-// Public STUN servers + optional TURN (set via env or passed in options)
-// ---------------------------------------------------------------------------
-
 function buildIceServers(extraServers = []) {
   const servers = [
     { urls: 'stun:stun.l.google.com:19302' },
@@ -34,13 +27,11 @@ function buildIceServers(extraServers = []) {
     { urls: 'stun:stun.stunprotocol.org:3478' },
   ]
 
-  // TURN server from environment (self-hosted)
   const turnUrl  = process.env.TURN_URL  || null
   const turnUser = process.env.TURN_USER || null
   const turnPass = process.env.TURN_PASS || null
   if (turnUrl && turnUser && turnPass) {
     servers.push({ urls: turnUrl, username: turnUser, credential: turnPass })
-    // Also add TURNS (TLS) variant
     const turnsUrl = turnUrl.replace(/^turn:/, 'turns:')
     if (turnsUrl !== turnUrl) {
       servers.push({ urls: turnsUrl, username: turnUser, credential: turnPass })
@@ -50,36 +41,53 @@ function buildIceServers(extraServers = []) {
   return [...servers, ...extraServers]
 }
 
-// ---------------------------------------------------------------------------
-// PCM audio pump
-// ---------------------------------------------------------------------------
-
 const SAMPLE_RATE    = 48000
 const CHANNELS       = 1
 const BITS           = 16
-const FRAME_DURATION = 10  // 10ms — wrtc RTCAudioSource expects 480 samples
-const FRAME_SAMPLES  = (SAMPLE_RATE * FRAME_DURATION) / 1000  // 480
-const FRAME_BYTES    = FRAME_SAMPLES * CHANNELS * (BITS / 8)  // 960
+const FRAME_DURATION = 10
+const FRAME_SAMPLES  = (SAMPLE_RATE * FRAME_DURATION) / 1000
+const FRAME_BYTES    = FRAME_SAMPLES * CHANNELS * (BITS / 8)
+
+const VIDEO_WIDTH   = 640
+const VIDEO_HEIGHT  = 360
+const VIDEO_FPS      = 30
+const VIDEO_FRAME_DURATION = Math.round(1000 / VIDEO_FPS)
 
 class AudioPlayer extends EventEmitter {
-  constructor(audioSource, filePath, loop = false) {
+  constructor(audioSource, filePath, loop = false, isVideoFile = false) {
     super()
     this._source     = audioSource
     this._filePath   = filePath
     this._loop       = loop
+    this._isVideo    = isVideoFile
     this._ffmpeg     = null
     this._timer      = null
     this._buf        = Buffer.alloc(0)
     this._stopped    = false
     this._paused     = true
     this._ffmpegDone = false
+    this._ready      = false  // Ready when buffer has enough data
+    this._volume     = 1.0    // Volume multiplier
+    this._framesSent = 0      // Track frames sent for debugging
+    this._lastPumpTime = 0    // Track last pump time for stability
   }
 
   start() {
     this._stopped    = false
     this._paused     = true
     this._ffmpegDone = false
+    this._ready      = false
+    this._framesSent = 0
     this._spawnFfmpeg()
+  }
+
+  // Check if player has buffered enough data to start smoothly
+  isReady() {
+    if (this._stopped) return false
+    // For video files, need more buffer to stay in sync
+    // For audio files, use larger buffer to prevent cutting
+    const minBuffer = this._isVideo ? FRAME_BYTES * 50 : FRAME_BYTES * 20
+    return this._buf.length >= minBuffer
   }
 
   unpause() {
@@ -101,24 +109,33 @@ class AudioPlayer extends EventEmitter {
     this._ffmpegDone = false
     this._bytesReceived = 0
     
-    // Add options for better streaming stability with multiple peers
-    // -fflags +nobuffer: reduce buffering latency
-    // -flags low_delay: prioritize low latency
-    // -probesize 32: smaller probe size for faster start
-    // -analyzeduration 0: don't analyze stream duration
-    this._ffmpeg = spawn('ffmpeg', [
-      '-loglevel', 'warning',
-      '-fflags', '+nobuffer',
-      '-flags', 'low_delay',
-      '-probesize', '32',
-      '-analyzeduration', '0',
+    // Improved settings to prevent audio cutting
+    const ffmpegArgs = ['-loglevel', 'warning']
+    
+    if (!this._isVideo) {
+      // Enhanced low-latency settings for audio-only files
+      ffmpegArgs.push(
+        '-fflags', '+nobuffer+fastseek',
+        '-flags', 'low_delay',
+        '-threads', '2',
+        '-probesize', '32',
+        '-analyzeduration', '0'
+      )
+    } else {
+      // For video files, use standard settings for better sync
+      ffmpegArgs.push('-threads', '2')
+    }
+    
+    ffmpegArgs.push(
       '-i', this._filePath,
       '-f', 's16le',
       '-ar', String(SAMPLE_RATE),
       '-ac', String(CHANNELS),
-      '-af', 'aresample=async=1:min_comp=0.001:first_pts=0',  // Async resampling for stability
-      'pipe:1',
-    ])
+      '-af', 'aresample=async=1:min_comp=0.001:first_pts=0',
+      'pipe:1'
+    )
+    
+    this._ffmpeg = spawn('ffmpeg', ffmpegArgs)
     this._ffmpeg.stdout.on('data', (chunk) => {
       this._buf = Buffer.concat([this._buf, chunk])
       this._bytesReceived += chunk.length
@@ -160,14 +177,14 @@ class AudioPlayer extends EventEmitter {
       return
     }
     
-    // For multi-peer stability, ensure we have enough buffered data
-    // to prevent underruns when network conditions vary between peers
-    const minBufferFrames = 5  // Minimum 5 frames (50ms) before pumping
+    // Enhanced buffer management to prevent cutting
+    const minBufferFrames = 8  // Increased from 5 to 8 frames (80ms) for better stability
     const minBufferBytes = minBufferFrames * FRAME_BYTES
     
+    // Check if we have enough data to send a frame
     if (this._buf.length >= FRAME_BYTES) {
       // Only warn about low buffer occasionally to avoid spam
-      if (this._buf.length < minBufferBytes && this._framesSent && this._framesSent % 100 === 0) {
+      if (this._buf.length < minBufferBytes && this._framesSent && this._framesSent % 50 === 0) {
         console.log(`[Wire/Voice] Low buffer warning: ${this._buf.length} bytes remaining`)
       }
       
@@ -176,7 +193,22 @@ class AudioPlayer extends EventEmitter {
       const frameData = Buffer.alloc(FRAME_BYTES)
       this._buf.copy(frameData, 0, 0, FRAME_BYTES)
       this._buf = this._buf.slice(FRAME_BYTES)
-      const samples = new Int16Array(frameData.buffer, frameData.byteOffset, FRAME_SAMPLES)
+      
+      // Apply volume if set
+      let samples = new Int16Array(frameData.buffer, frameData.byteOffset, FRAME_SAMPLES)
+      if (this._volume !== 1.0) {
+        const floatSamples = new Float32Array(FRAME_SAMPLES)
+        for (let i = 0; i < FRAME_SAMPLES; i++) {
+          floatSamples[i] = (samples[i] / 32768) * this._volume
+        }
+        // Convert back to Int16Array with clipping
+        samples = new Int16Array(FRAME_SAMPLES)
+        for (let i = 0; i < FRAME_SAMPLES; i++) {
+          const val = Math.max(-1, Math.min(1, floatSamples[i]))
+          samples[i] = Math.round(val * 32767)
+        }
+      }
+      
       try {
         this._source.onData({
           samples,
@@ -188,7 +220,7 @@ class AudioPlayer extends EventEmitter {
         this._framesSent = (this._framesSent || 0) + 1
         if (this._framesSent === 1) {
           console.log(`[Wire/Voice] PCM pump — FIRST FRAME SENT! Total frames: ${this._framesSent}, buf remaining: ${this._buf.length}`)
-        } else if (this._framesSent % 250 === 0) {
+        } else if (this._framesSent % 200 === 0) {
           console.log(`[Wire/Voice] PCM pump — frames sent: ${this._framesSent}, buf remaining: ${this._buf.length}`)
         }
       } catch (err) {
@@ -200,6 +232,154 @@ class AudioPlayer extends EventEmitter {
       this._buf = Buffer.concat([this._buf, silence])
     } else if (this._ffmpegDone && !this._loop && !this._stopped) {
       console.log(`[Wire/Voice] Audio finished — total frames sent: ${this._framesSent || 0}`)
+      this.stop()
+      this.emit('finish')
+    }
+  }
+
+  stop() {
+    this._stopped = true
+    if (this._ffmpeg) { try { this._ffmpeg.kill('SIGKILL') } catch {} ; this._ffmpeg = null }
+    if (this._timer)  { clearInterval(this._timer); this._timer = null }
+    this._buf = Buffer.alloc(0)
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Video pump using RTCVideoSource
+// ---------------------------------------------------------------------------
+
+class VideoPlayer extends EventEmitter {
+  constructor(videoSource, filePath, loop = false) {
+    super()
+    this._source     = videoSource
+    this._filePath   = filePath
+    this._loop       = loop
+    this._ffmpeg     = null
+    this._timer      = null
+    this._buf        = Buffer.alloc(0)
+    this._stopped    = false
+    this._paused     = true
+    this._ffmpegDone = false
+    this._framesSent = 0
+    this._width      = VIDEO_WIDTH
+    this._height     = VIDEO_HEIGHT
+  }
+
+  start() {
+    this._stopped    = false
+    this._paused     = true
+    this._ffmpegDone = false
+    this._framesSent = 0
+    this._spawnFfmpeg()
+  }
+
+  // Check if player has buffered enough data to start smoothly
+  isReady() {
+    if (this._stopped) return false
+    const frameSize = this._width * this._height * 3 / 2
+    // Need at least 5 frames buffered
+    return this._buf.length >= frameSize * 5
+  }
+
+  unpause() {
+    if (!this._paused) return
+    this._log(`[Wire/Voice] VideoPlayer unpausing — buf: ${this._buf.length} bytes`)
+    this._paused = false
+    if (!this._timer && !this._stopped) {
+      this._timer = setInterval(() => this._pump(), VIDEO_FRAME_DURATION)
+    }
+  }
+
+  _log(...args) { console.log('[Wire/Voice/Video]', ...args) }
+
+  _spawnFfmpeg() {
+    if (this._stopped) return
+    if (!fs.existsSync(this._filePath)) {
+      this.emit('error', new Error(`Video file not found: ${this._filePath}`))
+      return
+    }
+    this._ffmpegDone = false
+    this._bytesReceived = 0
+
+    this._ffmpeg = spawn('ffmpeg', [
+      '-loglevel', 'warning',
+      '-i', this._filePath,
+      '-an',
+      '-vf', `scale=${this._width}:${this._height}:force_original_aspect_ratio=decrease,pad=${this._width}:${this._height}:(ow-iw)/2:(oh-ih)/2,setsar=1`,
+      '-r', String(VIDEO_FPS),
+      '-c:v', 'rawvideo',
+      '-pix_fmt', 'yuv420p',
+      '-f', 'rawvideo',
+      'pipe:1',
+    ])
+
+    const frameSize = this._width * this._height * 3 / 2
+
+    this._ffmpeg.stdout.on('data', (chunk) => {
+      this._buf = Buffer.concat([this._buf, chunk])
+      this._bytesReceived += chunk.length
+    })
+    this._ffmpeg.stderr.on('data', (d) => {
+      const msg = d.toString().trim()
+      if (msg) console.warn('[Wire/Voice/Video] ffmpeg:', msg)
+    })
+    this._ffmpeg.on('close', (code) => {
+      this._log(`ffmpeg closed (code=${code}) bytesReceived=${this._bytesReceived}`)
+      this._ffmpeg    = null
+      this._ffmpegDone = true
+      if (this._bytesReceived === 0) {
+        this.emit('error', new Error('ffmpeg produced no video output — check video file and codec'))
+        return
+      }
+      if (!this._stopped && this._loop) {
+        const drain = setInterval(() => {
+          if (this._stopped) { clearInterval(drain); return }
+          if (this._buf.length < frameSize) {
+            clearInterval(drain)
+            this._ffmpegDone = false
+            this._spawnFfmpeg()
+          }
+        }, VIDEO_FRAME_DURATION)
+      }
+    })
+    this._ffmpeg.on('error', (err) => {
+      this._log('ffmpeg spawn error:', err.message)
+      this.emit('error', err)
+    })
+  }
+
+  _pump() {
+    if (this._stopped || this._paused) return
+    
+    const frameSize = this._width * this._height * 3 / 2 // YUV420p
+    
+    if (this._buf.length >= frameSize) {
+      const frameData = Buffer.alloc(frameSize)
+      this._buf.copy(frameData, 0, 0, frameSize)
+      this._buf = this._buf.slice(frameSize)
+      
+      try {
+        const videoFrame = {
+          width: this._width,
+          height: this._height,
+          data: new Uint8ClampedArray(frameData),
+        }
+        this._source.onFrame(videoFrame)
+        this._framesSent++
+        if (this._framesSent === 1) {
+          this._log(`FIRST FRAME SENT! Total frames: ${this._framesSent}`)
+        } else if (this._framesSent % 150 === 0) {
+          this._log(`Video pump — frames sent: ${this._framesSent}, buf remaining: ${this._buf.length}`)
+        }
+      } catch (err) {
+        this._log('Error sending video frame:', err.message)
+      }
+    } else if (this._buf.length > 0) {
+      const silence = Buffer.alloc(frameSize - this._buf.length, 128) // Gray for Y plane
+      this._buf = Buffer.concat([this._buf, silence])
+    } else if (this._ffmpegDone && !this._loop && !this._stopped) {
+      this._log(`Video finished — total frames sent: ${this._framesSent}`)
       this.stop()
       this.emit('finish')
     }
@@ -263,18 +443,23 @@ export class VoiceConnection extends EventEmitter {
     this._RTCSessionDescription = wrtc.RTCSessionDescription
     this._RTCIceCandidate       = wrtc.RTCIceCandidate
     this._MediaStream           = wrtc.MediaStream
-    const { RTCAudioSource }    = wrtc.nonstandard
+    const { RTCAudioSource, RTCVideoSource }    = wrtc.nonstandard
 
     this._audioSource = new RTCAudioSource()
     this._audioTrack  = this._audioSource.createTrack()
     this._audioTrack.enabled = true
-    // Wrap the track in a MediaStream so browsers receive event.streams[0]
-    // when this track arrives via ontrack — without this, event.streams is empty
     this._audioStream = new this._MediaStream([this._audioTrack])
+
+    this._videoSource = null
+    this._videoTrack  = null
+    this._videoStream = null
+    this._videoType   = null // 'webcam' or 'screen'
+    this._videoSender = null
 
     /** @type {Map<string, PeerState>} */
     this._peers     = new Map()
     this._player    = null
+    this._videoPlayer = null
     this._heartbeat = null
     this._joined    = false
 
@@ -305,9 +490,16 @@ export class VoiceConnection extends EventEmitter {
     this._onAnswer        = this._onAnswer.bind(this)
     this._onIceCandidate  = this._onIceCandidate.bind(this)
     this._onForceReconnect = this._onForceReconnect.bind(this)
+    this._onAnyDebug      = this._onAnyDebug.bind(this)
   }
 
   _log(...args) { if (this._debug) console.log('[Wire/Voice]', ...args) }
+
+  /** Debug handler for onAny — bound once so it can be properly removed */
+  _onAnyDebug(event, data) {
+    if (!event.startsWith('voice:')) return
+    this._log(`Socket event: ${event}`, data)
+  }
 
   // ---------------------------------------------------------------------------
   // Peer state reporting for consensus monitoring
@@ -459,6 +651,163 @@ export class VoiceConnection extends EventEmitter {
     return Promise.resolve()
   }
 
+  // ---------------------------------------------------------------------------
+  // Video playback
+  // ---------------------------------------------------------------------------
+
+  playVideo(filePath, { loop = false, type = 'screen' } = {}) {
+    this.stopVideo()
+    this.stopAudio() // Stop any existing audio
+    
+    const { RTCVideoSource } = loadWrtc().nonstandard
+    this._videoSource = new RTCVideoSource({ isScreencast: type === 'screen' })
+    this._videoTrack  = this._videoSource.createTrack()
+    this._videoTrack.enabled = true
+    this._videoTrack._senderTag = type // Tag like 'camera' or 'screen' for VoltApp to recognize
+    this._videoStream = new this._MediaStream([this._videoTrack])
+    this._videoType   = type
+
+    const resolved = path.resolve(filePath)
+    
+    // Start video player
+    this._videoPlayer = new VideoPlayer(this._videoSource, resolved, loop)
+    this._videoPlayer.on('finish', () => { 
+      this._log('Video finished:', resolved)
+      this.emit('videoFinish')
+      // Also stop audio when video finishes
+      this.stopAudio()
+      if (this._socket?.connected) {
+        this._socket.emit(type === 'screen' ? 'voice:screen-share' : 'voice:video', {
+          channelId: this._channelId,
+          userId: this._botId,
+          enabled: false,
+        })
+      }
+    })
+    this._videoPlayer.on('error',  (err) => { this._log('Video error:', err.message); this.emit('videoError', err) })
+    this._videoPlayer.start()
+    this._log(`Playing video: ${resolved} (type: ${type})`)
+    
+    // Also start audio player for the video's audio track (isVideoFile=true for sync)
+    this._player = new AudioPlayer(this._audioSource, resolved, loop, true)
+    this._player.on('finish', () => { 
+      this._log('Video audio finished:', resolved)
+      // Don't emit finish here - video player handles that
+    })
+    this._player.on('error',  (err) => { this._log('Video audio error:', err.message); this.emit('error', err) })
+    this._player.start()
+    this._log(`Playing video audio: ${resolved}`)
+
+    if (this._socket?.connected) {
+      this._socket.emit(type === 'screen' ? 'voice:screen-share' : 'voice:video', {
+        channelId: this._channelId,
+        userId: this._botId,
+        enabled: true,
+      })
+    }
+
+    this._addVideoTrackToPeers()
+
+    // Synchronized unpause function - waits for both players to be ready, then unpauses together
+    const syncUnpause = () => {
+      const videoPlayer = this._videoPlayer
+      const audioPlayer = this._player
+      
+      // Check if both players have buffered enough data
+      const videoReady = videoPlayer && !videoPlayer._stopped && videoPlayer.isReady()
+      const audioReady = audioPlayer && !audioPlayer._stopped && audioPlayer.isReady()
+      
+      if (videoReady && audioReady) {
+        this._log(`Both players ready - unpausing together (video buf: ${videoPlayer._buf.length}, audio buf: ${audioPlayer._buf.length})`)
+        this._addVideoTrackToPeers()
+        videoPlayer.unpause()
+        audioPlayer.unpause()
+        return true
+      } else if (videoPlayer && audioPlayer) {
+        this._log(`Waiting for buffers - video ready: ${videoReady}, audio ready: ${audioReady}`)
+      }
+      return false
+    }
+
+    // Try to unpause when both are ready, with polling
+    const trySyncUnpause = () => {
+      if (!syncUnpause()) {
+        // Not ready yet, try again in 50ms
+        setTimeout(trySyncUnpause, 50)
+      }
+    }
+
+    if (this._hasConnectedPeer()) {
+      this._log('Peers already connected — waiting for both players to buffer, then unpausing together')
+      // Start trying to sync unpause after a small delay for ffmpeg to start
+      setTimeout(trySyncUnpause, 100)
+      return Promise.resolve()
+    }
+
+    const onPeerJoin = () => {
+      this._log('Peer joined — unpausing video and audio together')
+      syncUnpause()
+    }
+    this.once('peerJoin', onPeerJoin)
+
+    // Fallback timers - unpause both together
+    setTimeout(() => {
+      if (this._peers.size > 0) {
+        this._log('Fallback 2s: unpausing video and audio together')
+        syncUnpause()
+      }
+    }, 2000)
+
+    setTimeout(() => {
+      this._log('Fallback 5s: force-unpausing video and audio together')
+      syncUnpause()
+      this.off('peerJoin', onPeerJoin)
+    }, 5000)
+
+    return Promise.resolve()
+  }
+
+  _addVideoTrackToPeers() {
+    if (!this._videoTrack || !this._videoStream) return
+    for (const ps of this._peers.values()) {
+      if (ps.pc && ps.pc.connectionState === 'connected') {
+        try {
+          const sender = ps.pc.addTrack(this._videoTrack, this._videoStream)
+          if (sender) {
+            this._log(`Added video track to peer ${ps.peerId}`)
+          }
+        } catch (err) {
+          this._log(`Error adding video track to peer ${ps.peerId}:`, err.message)
+        }
+      }
+    }
+  }
+
+  stopVideo() {
+    const videoType = this._videoType
+    if (this._videoPlayer) { this._videoPlayer.stop(); this._videoPlayer = null }
+    // Also stop audio when stopping video (for video files with audio)
+    if (this._player) { this._player.stop(); this._player = null }
+    if (this._videoTrack) { 
+      try { this._videoTrack.stop() } catch {} 
+      this._videoTrack = null 
+    }
+    if (this._videoSource) { this._videoSource = null }
+    if (this._videoStream) { 
+      try { this._videoStream.getTracks().forEach(t => t.stop()) } catch {} 
+      this._videoStream = null 
+    }
+    this._videoType = null
+
+    if (this._socket?.connected && videoType) {
+      this._socket.emit(videoType === 'screen' ? 'voice:screen-share' : 'voice:video', {
+        channelId: this._channelId,
+        userId: this._botId,
+        enabled: false,
+      })
+    }
+  }
+
   _hasConnectedPeer() {
     for (const ps of this._peers.values()) {
       if (ps.pc?.connectionState === 'connected') return true
@@ -470,18 +819,21 @@ export class VoiceConnection extends EventEmitter {
     // Guard: check if player exists and is in a state where we should unpause
     if (!this._player) {
       this._log('Peer connected — but no player exists yet')
-      return
-    }
-    if (!this._player._paused) {
+    } else if (!this._player._paused) {
       this._log('Peer connected — audio pump already running')
-      return
+    } else if (!this._player._stopped) {
+      this._log(`Peer connected — starting audio pump (buf: ${this._player._buf.length} bytes)`)
+      this._player.unpause()
     }
-    if (this._player._stopped) {
-      this._log('Peer connected — but player is stopped')
-      return
+
+    // Also handle video
+    if (this._videoPlayer && this._videoTrack) {
+      this._addVideoTrackToPeers()
+      if (this._videoPlayer._paused && !this._videoPlayer._stopped) {
+        this._log('Peer connected — starting video pump')
+        this._videoPlayer.unpause()
+      }
     }
-    this._log(`Peer connected — starting audio pump (buf: ${this._player._buf.length} bytes)`)
-    this._player.unpause()
   }
 
   stopAudio() {
@@ -493,8 +845,9 @@ export class VoiceConnection extends EventEmitter {
   // ---------------------------------------------------------------------------
 
   leave() {
-    this._log(`Leaving channel ${this._channelId}`)
+    this._log(`Leaving channel ${this._channelId} (reason: ${new Error().stack})`)
     this.stopAudio()
+    this.stopVideo()
     this._clearAllPeers()
     
     // Clear connection management state
@@ -691,6 +1044,10 @@ export class VoiceConnection extends EventEmitter {
     this._socket.on('voice:answer',        this._onAnswer)
     this._socket.on('voice:ice-candidate', this._onIceCandidate)
     this._socket.on('voice:force-reconnect', this._onForceReconnect)
+    // Debug: log all voice events (using bound method so it can be removed)
+    if (this._debug) {
+      this._socket.onAny(this._onAnyDebug)
+    }
   }
 
   _deregisterSocketListeners() {
@@ -701,6 +1058,10 @@ export class VoiceConnection extends EventEmitter {
     this._socket.off('voice:answer',        this._onAnswer)
     this._socket.off('voice:ice-candidate', this._onIceCandidate)
     this._socket.off('voice:force-reconnect', this._onForceReconnect)
+    // Remove the onAny debug listener
+    if (this._socket.offAny) {
+      this._socket.offAny(this._onAnyDebug)
+    }
   }
 
   // ---------------------------------------------------------------------------
@@ -817,6 +1178,7 @@ export class VoiceConnection extends EventEmitter {
 
   /**
    * Handle force-reconnect command from server (consensus broken)
+   * Bots are more resilient - they only reconnect for critical issues
    */
   _onForceReconnect(data) {
     const { channelId, reason, targetPeer, failurePercent, timestamp } = data
@@ -824,20 +1186,20 @@ export class VoiceConnection extends EventEmitter {
     
     this._log(`Force-reconnect received: ${reason}, target=${targetPeer}, failures=${failurePercent}%`)
     
+    // Bots are resilient - only reconnect to specific problematic peers, not full reconnect
+    // This prevents bot disconnection loops
     if (targetPeer === this._botId) {
-      // I am the problematic peer - perform full reconnect
-      this._log('I am the target peer - performing full reconnect in 1s')
-      setTimeout(() => {
-        this.leave()
-        setTimeout(() => this.join(), 500)
-      }, 1000)
+      // I am the target peer - but as a bot, just reconnect to peers individually
+      this._log('Bot targeted for reconnect - rebuilding peer connections instead of full reconnect')
+      // Don't do a full leave/join cycle - just rebuild peer connections
+      for (const peerId of [...this._peers.keys()]) {
+        this._destroyPeerState(peerId)
+        this._queueConnection(peerId)
+      }
     } else if (targetPeer === 'all' || targetPeer === '*') {
-      // Everyone reconnect
-      this._log('Full channel reconnect requested - performing full reconnect in 1s')
-      setTimeout(() => {
-        this.leave()
-        setTimeout(() => this.join(), 500)
-      }, 1000)
+      // Everyone reconnect - but as a bot, just rebuild specific peer connections
+      this._log('Full channel reconnect requested - bot will rebuild peer connections')
+      // Don't do a full leave/join cycle for bots
     } else {
       // Reconnect to specific peer only
       this._log(`Reconnecting to specific peer ${targetPeer}`)

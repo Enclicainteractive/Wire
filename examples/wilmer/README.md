@@ -15,7 +15,7 @@ npm install
 4. Run the bot:
 
 ```bash
-WILMER_TOKEN=vbot_your_token VOLT_SERVER=https://your-server.com npm start
+WILMER_TOKEN=vbot_1b76ffb8bd8147375cad63a75eb35ffd1cf03c7a2e8ac541591b283f9005aa4a VOLT_SERVER=https://volt.voltagechat.app npm start
 ```
 
 ## Commands
