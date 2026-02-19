@@ -769,17 +769,48 @@ export class VoiceConnection extends EventEmitter {
 
   _addVideoTrackToPeers() {
     if (!this._videoTrack || !this._videoStream) return
+    let addedNewTrack = false
+    
     for (const ps of this._peers.values()) {
       if (ps.pc && ps.pc.connectionState === 'connected') {
+        // Check if we already have a sender for this exact track
+        const existingSender = ps.pc.getSenders().find(s => s.track === this._videoTrack)
+        if (existingSender) {
+          this._log(`Video track already added to peer ${ps.peerId}, skipping`)
+          continue
+        }
+        
+        // Check if we have any video sender (could be from a previous track)
+        const videoSender = ps.pc.getSenders().find(s => s.track?.kind === 'video')
+        if (videoSender) {
+          // Replace the existing video track instead of adding a new one
+          // replaceTrack doesn't require renegotiation
+          try {
+            videoSender.replaceTrack(this._videoTrack)
+            this._log(`Replaced video track for peer ${ps.peerId}`)
+          } catch (err) {
+            this._log(`Error replacing video track for peer ${ps.peerId}:`, err.message)
+          }
+          continue
+        }
+        
+        // Add new video track - this will trigger onnegotiationneeded
         try {
           const sender = ps.pc.addTrack(this._videoTrack, this._videoStream)
           if (sender) {
             this._log(`Added video track to peer ${ps.peerId}`)
+            addedNewTrack = true
           }
         } catch (err) {
           this._log(`Error adding video track to peer ${ps.peerId}:`, err.message)
         }
       }
+    }
+    
+    // Note: onnegotiationneeded will fire automatically when addTrack is called
+    // No need to manually trigger renegotiation
+    if (addedNewTrack) {
+      this._log(`Video track added to one or more peers - renegotiation will happen automatically`)
     }
   }
 
