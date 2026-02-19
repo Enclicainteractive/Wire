@@ -57,9 +57,9 @@ function buildIceServers(extraServers = []) {
 const SAMPLE_RATE    = 48000
 const CHANNELS       = 1
 const BITS           = 16
-const FRAME_DURATION = 20
-const FRAME_SAMPLES  = (SAMPLE_RATE * FRAME_DURATION) / 1000  // 960
-const FRAME_BYTES    = FRAME_SAMPLES * CHANNELS * (BITS / 8)  // 1920
+const FRAME_DURATION = 10  // 10ms — wrtc RTCAudioSource expects 480 samples
+const FRAME_SAMPLES  = (SAMPLE_RATE * FRAME_DURATION) / 1000  // 480
+const FRAME_BYTES    = FRAME_SAMPLES * CHANNELS * (BITS / 8)  // 960
 
 class AudioPlayer extends EventEmitter {
   constructor(audioSource, filePath, loop = false) {
@@ -83,9 +83,12 @@ class AudioPlayer extends EventEmitter {
   }
 
   unpause() {
+    if (!this._paused) return   // already running — idempotent
+    console.log(`[Wire/Voice] AudioPlayer unpausing — buf: ${this._buf.length} bytes, ffmpegDone: ${this._ffmpegDone}`)
     this._paused = false
     if (!this._timer && !this._stopped) {
       this._timer = setInterval(() => this._pump(), FRAME_DURATION)
+      console.log(`[Wire/Voice] AudioPlayer pump timer started (interval: ${FRAME_DURATION}ms)`)
     }
   }
 
@@ -96,8 +99,9 @@ class AudioPlayer extends EventEmitter {
       return
     }
     this._ffmpegDone = false
+    this._bytesReceived = 0
     this._ffmpeg = spawn('ffmpeg', [
-      '-loglevel', 'quiet',
+      '-loglevel', 'warning',   // show warnings so missing codecs surface
       '-i', this._filePath,
       '-f', 's16le',
       '-ar', String(SAMPLE_RATE),
@@ -106,11 +110,20 @@ class AudioPlayer extends EventEmitter {
     ])
     this._ffmpeg.stdout.on('data', (chunk) => {
       this._buf = Buffer.concat([this._buf, chunk])
+      this._bytesReceived += chunk.length
     })
-    this._ffmpeg.stderr.on('data', () => {})
-    this._ffmpeg.on('close', () => {
+    this._ffmpeg.stderr.on('data', (d) => {
+      const msg = d.toString().trim()
+      if (msg) console.warn('[Wire/Voice] ffmpeg:', msg)
+    })
+    this._ffmpeg.on('close', (code) => {
+      console.log(`[Wire/Voice] ffmpeg closed (code=${code}) bytesReceived=${this._bytesReceived}`)
       this._ffmpeg    = null
       this._ffmpegDone = true
+      if (this._bytesReceived === 0) {
+        this.emit('error', new Error('ffmpeg produced no PCM output — check audio file and codec'))
+        return
+      }
       if (!this._stopped && this._loop) {
         const drain = setInterval(() => {
           if (this._stopped) { clearInterval(drain); return }
@@ -122,15 +135,26 @@ class AudioPlayer extends EventEmitter {
         }, FRAME_DURATION)
       }
     })
-    this._ffmpeg.on('error', (err) => this.emit('error', err))
+    this._ffmpeg.on('error', (err) => {
+      console.error('[Wire/Voice] ffmpeg spawn error:', err.message)
+      this.emit('error', err)
+    })
   }
 
   _pump() {
-    if (this._stopped || this._paused) return
+    if (this._stopped || this._paused) {
+      if (this._framesSent && this._framesSent < 10) {
+        console.log(`[Wire/Voice] Pump skipped — stopped=${this._stopped}, paused=${this._paused}`)
+      }
+      return
+    }
     if (this._buf.length >= FRAME_BYTES) {
-      const frame   = this._buf.slice(0, FRAME_BYTES)
-      this._buf     = this._buf.slice(FRAME_BYTES)
-      const samples = new Int16Array(frame.buffer, frame.byteOffset, frame.byteLength / 2)
+      // Extract frame data and create a proper Int16Array copy
+      // We must copy because frame.buffer may be the entire pool, not just our slice
+      const frameData = Buffer.alloc(FRAME_BYTES)
+      this._buf.copy(frameData, 0, 0, FRAME_BYTES)
+      this._buf = this._buf.slice(FRAME_BYTES)
+      const samples = new Int16Array(frameData.buffer, frameData.byteOffset, FRAME_SAMPLES)
       try {
         this._source.onData({
           samples,
@@ -139,8 +163,21 @@ class AudioPlayer extends EventEmitter {
           channelCount:   CHANNELS,
           numberOfFrames: FRAME_SAMPLES,
         })
-      } catch { /* peer disconnected */ }
+        this._framesSent = (this._framesSent || 0) + 1
+        if (this._framesSent === 1) {
+          console.log(`[Wire/Voice] PCM pump — FIRST FRAME SENT! Total frames: ${this._framesSent}, buf remaining: ${this._buf.length}`)
+        } else if (this._framesSent % 250 === 0) {
+          console.log(`[Wire/Voice] PCM pump — frames sent: ${this._framesSent}, buf remaining: ${this._buf.length}`)
+        }
+      } catch (err) {
+        console.error('[Wire/Voice] Error sending audio frame:', err.message)
+      }
+    } else if (this._buf.length > 0) {
+      // Partial frame — pad with silence so the last chunk still gets sent
+      const silence = Buffer.alloc(FRAME_BYTES - this._buf.length, 0)
+      this._buf = Buffer.concat([this._buf, silence])
     } else if (this._ffmpegDone && !this._loop && !this._stopped) {
+      console.log(`[Wire/Voice] Audio finished — total frames sent: ${this._framesSent || 0}`)
       this.stop()
       this.emit('finish')
     }
@@ -275,19 +312,44 @@ export class VoiceConnection extends EventEmitter {
     this._player.on('error',  (err) => { this._log('Audio error:', err.message); this.emit('error', err) })
     this._player.start()
     this._log('Playing:', resolved)
+
+    // If already connected, unpause immediately
     if (this._hasConnectedPeer()) {
+      this._log('Peers already connected — unpausing immediately')
       this._player.unpause()
-    } else {
-      // Hard fallback: if wrtc never fires 'connected' and there are peers,
-      // start the pump after 3 s so audio doesn't silently hang forever.
-      const player = this._player
-      setTimeout(() => {
-        if (player._paused && !player._stopped && this._peers.size > 0) {
-          this._log('Fallback: unpausing audio pump after 3 s (wrtc connection state unreliable)')
-          player.unpause()
-        }
-      }, 3000)
+      return Promise.resolve()
     }
+
+    // Store reference to player for callbacks
+    const player = this._player
+
+    // Listen for peerJoin events to unpause when a peer connects
+    const onPeerJoin = () => {
+      if (player && player._paused && !player._stopped) {
+        this._log('Peer joined — unpausing audio pump from event')
+        player.unpause()
+      }
+    }
+    this.once('peerJoin', onPeerJoin)
+
+    // Fallback 1: unpause after 2 s if peers exist but connected event was missed
+    setTimeout(() => {
+      if (player._paused && !player._stopped && this._peers.size > 0) {
+        this._log('Fallback 2s: unpausing audio pump (peer exists, state unreliable)')
+        player.unpause()
+      }
+    }, 2000)
+
+    // Fallback 2: always unpause after 5 s regardless
+    setTimeout(() => {
+      if (player._paused && !player._stopped) {
+        this._log('Fallback 5s: force-unpausing audio pump')
+        player.unpause()
+      }
+      // Clean up the one-time listener
+      this.off('peerJoin', onPeerJoin)
+    }, 5000)
+
     return Promise.resolve()
   }
 
@@ -299,10 +361,21 @@ export class VoiceConnection extends EventEmitter {
   }
 
   _onPeerConnected() {
-    if (this._player?._paused) {
-      this._log('Peer connected — starting audio pump')
-      this._player.unpause()
+    // Guard: check if player exists and is in a state where we should unpause
+    if (!this._player) {
+      this._log('Peer connected — but no player exists yet')
+      return
     }
+    if (!this._player._paused) {
+      this._log('Peer connected — audio pump already running')
+      return
+    }
+    if (this._player._stopped) {
+      this._log('Peer connected — but player is stopped')
+      return
+    }
+    this._log(`Peer connected — starting audio pump (buf: ${this._player._buf.length} bytes)`)
+    this._player.unpause()
   }
 
   stopAudio() {
@@ -376,7 +449,9 @@ export class VoiceConnection extends EventEmitter {
 
     // Add audio track associated with our stream so the remote peer receives
     // event.streams[0] in their ontrack handler (required for Audio.srcObject)
-    pc.addTrack(this._audioTrack, this._audioStream)
+    this._log(`Adding audio track to peer ${ps.peerId} — track enabled: ${this._audioTrack.enabled}, stream tracks: ${this._audioStream.getTracks().length}`)
+    const sender = pc.addTrack(this._audioTrack, this._audioStream)
+    this._log(`Audio track added — sender exists: ${!!sender}`)
 
     // Send local ICE candidates to the remote peer
     pc.onicecandidate = ({ candidate }) => {
@@ -404,8 +479,11 @@ export class VoiceConnection extends EventEmitter {
     pc.onconnectionstatechange = () => {
       this._log(`Peer ${ps.peerId} connection state: ${pc.connectionState}`)
       if (pc.connectionState === 'connected') {
-        this._onPeerConnected()
-        this.emit('peerJoin', ps.peerId)
+        if (!ps._peerJoinEmitted) {
+          ps._peerJoinEmitted = true
+          this._onPeerConnected()
+          this.emit('peerJoin', ps.peerId)
+        }
       }
       if (pc.connectionState === 'failed' || pc.connectionState === 'closed') {
         this._destroyPeerState(ps.peerId)
@@ -644,15 +722,24 @@ export class VoiceConnection extends EventEmitter {
    * onconnectionstatechange for the 'connected' transition.
    */
   _pollForConnected(ps, attempts = 0) {
-    const MAX = 20  // 20 × 250 ms = 5 s
-    if (attempts >= MAX) return
+    const MAX = 40  // 40 × 250 ms = 10 s
+    if (attempts >= MAX) {
+      this._log(`Poll timed out for ${ps.peerId} — forcing unpause`)
+      this._onPeerConnected()
+      return
+    }
     setTimeout(() => {
       if (!ps.pc) return
       const state = ps.pc.connectionState
-      this._log(`Poll connectionState for ${ps.peerId}: ${state} (attempt ${attempts + 1})`)
+      if (attempts === 0 || attempts % 4 === 0) {
+        this._log(`Poll connectionState for ${ps.peerId}: ${state} (attempt ${attempts + 1})`)
+      }
       if (state === 'connected') {
-        this._onPeerConnected()
-        this.emit('peerJoin', ps.peerId)
+        if (!ps._peerJoinEmitted) {
+          ps._peerJoinEmitted = true
+          this._onPeerConnected()
+          this.emit('peerJoin', ps.peerId)
+        }
       } else if (state === 'failed' || state === 'closed') {
         // Give up
       } else {

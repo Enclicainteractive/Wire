@@ -5,10 +5,12 @@ export class Message {
     this.serverId    = data.serverId   || null
     this.userId      = data.userId
     this.username    = data.username
+    this.host        = data.host       || null  // originating server host of the author
     this.avatar      = data.avatar     || null
     this.content     = data.content    || ''
     this.embeds      = data.embeds     || []
     this.attachments = data.attachments || []
+    this.mentions    = data.mentions   || { users: [], usernames: [], federated: [], everyone: false, here: false }
     this.bot         = data.bot        || false
     this.pinned      = data.pinned     || false
     this.replyTo     = data.replyTo    || null
@@ -21,9 +23,20 @@ export class Message {
   // Accessors
   // ---------------------------------------------------------------------------
 
-  /** Shorthand author object. */
+  /**
+   * Shorthand author object including the author's host for federated identity.
+   * For bots, host is null.
+   */
   get author() {
-    return { id: this.userId, username: this.username, avatar: this.avatar, bot: this.bot }
+    return {
+      id: this.userId,
+      username: this.username,
+      host: this.host,
+      /** Full federated identity string: @username:host (or just @username for local/bot) */
+      federatedId: this.host ? `@${this.username}:${this.host}` : `@${this.username}`,
+      avatar: this.avatar,
+      bot: this.bot
+    }
   }
 
   /** Age of the message in milliseconds. */
@@ -128,9 +141,44 @@ export class Message {
     }
   }
 
-  /** Whether the message content mentions a given user ID. */
-  mentions(userId) {
-    return this.content.includes(userId)
+  /**
+   * Parse all @username:host mentions from the message content.
+   * Returns an array of objects: { raw, username, host, federatedId }
+   * @returns {Array<{raw: string, username: string, host: string|null, federatedId: string}>}
+   */
+  getMentions() {
+    const results = []
+    const re = /@([a-zA-Z0-9_\-.]+)(?::([a-zA-Z0-9_\-.]+))?/g
+    let m
+    while ((m = re.exec(this.content)) !== null) {
+      const username = m[1]
+      const host = m[2] || null
+      if (username === 'everyone' || username === 'here') continue
+      results.push({
+        raw: m[0],
+        username,
+        host,
+        federatedId: host ? `@${username}:${host}` : `@${username}`
+      })
+    }
+    return results
+  }
+
+  /**
+   * Whether this message mentions a specific user by their federated ID (@username:host)
+   * or by bare username (for backward compat).
+   * @param {string} federatedIdOrUsername  e.g. "@alice:example.com" or "alice"
+   */
+  mentionsUser(federatedIdOrUsername) {
+    const needle = federatedIdOrUsername.startsWith('@')
+      ? federatedIdOrUsername
+      : `@${federatedIdOrUsername}`
+    return this.content.includes(needle)
+  }
+
+  /** @deprecated Use mentionsUser() instead */
+  mentionsById(userId) {
+    return this.mentions?.users?.includes(userId) ?? this.content.includes(userId)
   }
 
   /** Whether the message has any embeds. */
@@ -146,8 +194,9 @@ export class Message {
   toJSON() {
     return {
       id: this.id, channelId: this.channelId, serverId: this.serverId,
-      userId: this.userId, username: this.username, avatar: this.avatar,
+      userId: this.userId, username: this.username, host: this.host, avatar: this.avatar,
       content: this.content, embeds: this.embeds, attachments: this.attachments,
+      mentions: this.mentions,
       bot: this.bot, pinned: this.pinned, replyTo: this.replyTo,
       timestamp: this.timestamp.toISOString(), edited: this.edited
     }

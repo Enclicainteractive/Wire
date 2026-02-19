@@ -77,7 +77,14 @@ export class Client extends EventEmitter {
     ])
 
     this.bot = me
-    this._log('Authenticated as', me.name, `(${me.id})`)
+    // Derive the host from the serverUrl (bots are local to their server, no user host)
+    try {
+      this.serverHost = new URL(this.serverUrl).host
+    } catch {
+      this.serverHost = this.serverUrl
+    }
+    this.bot.serverHost = this.serverHost
+    this._log('Authenticated as', me.name, `(${me.id}) on ${this.serverHost}`)
     this._log('Gateway URL from server:', gateway.url || '(none, using serverUrl)')
 
     return this._connectGateway(gateway.url || this.serverUrl)
@@ -180,7 +187,11 @@ export class Client extends EventEmitter {
 
       this.socket.on(GatewayEvents.MEMBER_JOIN, (data) => {
         if (data.serverId && data.id) {
-          this.members.set(`${data.serverId}:${data.id}`, data)
+          // Cache member with host for federated identity awareness
+          this.members.set(`${data.serverId}:${data.id}`, {
+            ...data,
+            federatedId: data.host ? `@${data.username}:${data.host}` : `@${data.username}`
+          })
         }
         this.emit('memberJoin', data)
       })
@@ -229,11 +240,22 @@ export class Client extends EventEmitter {
       // -- Voice --
 
       this.socket.on(GatewayEvents.VOICE_JOIN, (data) => {
-        this.emit('voiceJoin', data)
+        // Resolve channel name from cache if available
+        const channelId = data.channelId
+        const channel = channelId ? this.channels.get(channelId) : null
+        this.emit('voiceJoin', {
+          ...data,
+          channelName: channel?.name || channelId || 'unknown'
+        })
       })
 
       this.socket.on(GatewayEvents.VOICE_LEAVE, (data) => {
-        this.emit('voiceLeave', data)
+        const channelId = data.channelId
+        const channel = channelId ? this.channels.get(channelId) : null
+        this.emit('voiceLeave', {
+          ...data,
+          channelName: channel?.name || channelId || 'unknown'
+        })
       })
 
       this.socket.on(GatewayEvents.VOICE_USER_UPDATE, (data) => {
@@ -355,18 +377,6 @@ export class Client extends EventEmitter {
   }
 
   /**
-   * Fetch and cache all members of a server.
-   * @param {string} serverId
-   */
-  async fetchMembers(serverId) {
-    const members = await this.rest.getServerMembers(serverId)
-    for (const m of members) {
-      this.members.set(`${serverId}:${m.id}`, m)
-    }
-    return members
-  }
-
-  /**
    * Fetch and cache a server's channels.
    * @param {string} serverId
    */
@@ -386,6 +396,70 @@ export class Client extends EventEmitter {
     const server = await this.rest.getServer(serverId)
     if (server?.id) this.servers.set(server.id, server)
     return server
+  }
+
+  /**
+   * Fetch all members of a server and cache them with federated identity.
+   * @param {string} serverId
+   * @returns {Promise<Array>} Members with federatedId field populated.
+   */
+  async fetchMembers(serverId) {
+    const members = await this.rest.getServerMembers(serverId)
+    for (const m of (Array.isArray(members) ? members : [])) {
+      const enriched = {
+        ...m,
+        federatedId: (!m.isBot && m.host) ? `@${m.username}:${m.host}` : null
+      }
+      this.members.set(`${serverId}:${m.id}`, enriched)
+    }
+    return members
+  }
+
+  /**
+   * Get a cached member from a server.
+   * @param {string} serverId
+   * @param {string} userId
+   * @returns {object|undefined}
+   */
+  getMember(serverId, userId) {
+    return this.members.get(`${serverId}:${userId}`)
+  }
+
+  /**
+   * Get the full federated identity string for a user in a server.
+   * Returns "@username:host" for regular users, null for bots.
+   * @param {string} serverId
+   * @param {string} userId
+   * @returns {string|null}
+   */
+  getMemberFederatedId(serverId, userId) {
+    const member = this.getMember(serverId, userId)
+    if (!member || member.isBot) return null
+    return member.host ? `@${member.username}:${member.host}` : null
+  }
+
+  /**
+   * Parse all @username:host mentions from a content string.
+   * Returns an array of { raw, username, host, federatedId }.
+   * @param {string} content
+   * @returns {Array<{raw:string, username:string, host:string|null, federatedId:string}>}
+   */
+  parseMentions(content) {
+    const results = []
+    const re = /@([a-zA-Z0-9_\-.]+)(?::([a-zA-Z0-9_\-.]+))?/g
+    let m
+    while ((m = re.exec(content)) !== null) {
+      const username = m[1]
+      const host = m[2] || null
+      if (username === 'everyone' || username === 'here') continue
+      results.push({
+        raw: m[0],
+        username,
+        host,
+        federatedId: host ? `@${username}:${host}` : `@${username}`
+      })
+    }
+    return results
   }
 
   // ---------------------------------------------------------------------------

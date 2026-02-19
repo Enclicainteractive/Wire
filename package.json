@@ -5,14 +5,14 @@
   "main": "src/index.js",
   "type": "module",
   "exports": {
-    ".":             "./src/index.js",
-    "./client":      "./src/Client.js",
-    "./rest":        "./src/RestClient.js",
-    "./commands":    "./src/CommandRegistry.js",
-    "./collection":  "./src/Collection.js",
-    "./embed":       "./src/Embed.js",
-    "./webhook":     "./src/WebhookServer.js",
-    "./voice":       "./src/VoiceConnection.js"
+    ".": "./src/index.js",
+    "./client": "./src/Client.js",
+    "./rest": "./src/RestClient.js",
+    "./commands": "./src/CommandRegistry.js",
+    "./collection": "./src/Collection.js",
+    "./embed": "./src/Embed.js",
+    "./webhook": "./src/WebhookServer.js",
+    "./voice": "./src/VoiceConnection.js"
   },
   "keywords": [
     "voltchat",
@@ -36,10 +36,12 @@
     "socket.io-client": "^4.7.0"
   },
   "peerDependenciesMeta": {
-    "@roamhq/wrtc": { "optional": true }
+    "@roamhq/wrtc": {
+      "optional": true
+    }
   },
   "peerDependencies": {
-    "@roamhq/wrtc": ">=0.9.0"
+    "@roamhq/wrtc": "^0.9.1"
   },
   "engines": {
     "node": ">=18.0.0"
