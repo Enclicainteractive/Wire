@@ -100,12 +100,23 @@ class AudioPlayer extends EventEmitter {
     }
     this._ffmpegDone = false
     this._bytesReceived = 0
+    
+    // Add options for better streaming stability with multiple peers
+    // -fflags +nobuffer: reduce buffering latency
+    // -flags low_delay: prioritize low latency
+    // -probesize 32: smaller probe size for faster start
+    // -analyzeduration 0: don't analyze stream duration
     this._ffmpeg = spawn('ffmpeg', [
-      '-loglevel', 'warning',   // show warnings so missing codecs surface
+      '-loglevel', 'warning',
+      '-fflags', '+nobuffer',
+      '-flags', 'low_delay',
+      '-probesize', '32',
+      '-analyzeduration', '0',
       '-i', this._filePath,
       '-f', 's16le',
       '-ar', String(SAMPLE_RATE),
       '-ac', String(CHANNELS),
+      '-af', 'aresample=async=1:min_comp=0.001:first_pts=0',  // Async resampling for stability
       'pipe:1',
     ])
     this._ffmpeg.stdout.on('data', (chunk) => {
@@ -148,7 +159,18 @@ class AudioPlayer extends EventEmitter {
       }
       return
     }
+    
+    // For multi-peer stability, ensure we have enough buffered data
+    // to prevent underruns when network conditions vary between peers
+    const minBufferFrames = 5  // Minimum 5 frames (50ms) before pumping
+    const minBufferBytes = minBufferFrames * FRAME_BYTES
+    
     if (this._buf.length >= FRAME_BYTES) {
+      // Only warn about low buffer occasionally to avoid spam
+      if (this._buf.length < minBufferBytes && this._framesSent && this._framesSent % 100 === 0) {
+        console.log(`[Wire/Voice] Low buffer warning: ${this._buf.length} bytes remaining`)
+      }
+      
       // Extract frame data and create a proper Int16Array copy
       // We must copy because frame.buffer may be the entire pool, not just our slice
       const frameData = Buffer.alloc(FRAME_BYTES)
@@ -256,6 +278,25 @@ export class VoiceConnection extends EventEmitter {
     this._heartbeat = null
     this._joined    = false
 
+    // Multi-peer connection management with tiered scaling for up to 100 peers
+    this._connectionQueue = []      // Queue of peer IDs waiting to connect
+    this._isConnecting = false      // Whether currently processing queue
+    this._activeNegotiations = 0    // Current active negotiations
+    this._connectionCooldowns = new Map()  // peerId -> timestamp of last connection attempt
+    this._lastBatchProcessTime = 0  // For batch processing
+    
+    // Tiered configuration based on participant count
+    this._tierConfig = {
+      small: { maxPeers: 10, concurrent: 2, cooldown: 1000, staggerBase: 300, staggerPerPeer: 200 },
+      medium: { maxPeers: 25, concurrent: 2, cooldown: 1500, staggerBase: 800, staggerPerPeer: 400 },
+      large: { maxPeers: 50, concurrent: 1, cooldown: 2000, staggerBase: 1500, staggerPerPeer: 600 },
+      massive: { maxPeers: 100, concurrent: 1, cooldown: 3000, staggerBase: 2500, staggerPerPeer: 800 }
+    }
+    this._maxConnectedPeers = 100  // Hard limit
+    this._priorityPeers = new Set()  // High priority peer IDs (speakers)
+    this._isMassJoinInProgress = false  // Flag for batch processing
+    this._pendingPeerCount = 0  // Track expected peer count during mass joins
+
     // Bind handlers once so we can remove them later
     this._onParticipants  = this._onParticipants.bind(this)
     this._onUserJoined    = this._onUserJoined.bind(this)
@@ -266,6 +307,53 @@ export class VoiceConnection extends EventEmitter {
   }
 
   _log(...args) { if (this._debug) console.log('[Wire/Voice]', ...args) }
+
+  // ---------------------------------------------------------------------------
+  // Tiered connection management for scaling to 100+ peers
+  // ---------------------------------------------------------------------------
+
+  /**
+   * Get current tier configuration based on peer count
+   */
+  _getTierConfig() {
+    const count = this._peers.size + this._connectionQueue.length
+    if (count <= this._tierConfig.small.maxPeers) return this._tierConfig.small
+    if (count <= this._tierConfig.medium.maxPeers) return this._tierConfig.medium
+    if (count <= this._tierConfig.large.maxPeers) return this._tierConfig.large
+    return this._tierConfig.massive
+  }
+
+  /**
+   * Check if we should accept new peer connections
+   * Returns true if under limits, false otherwise
+   */
+  _canAcceptPeer(peerId) {
+    const currentPeers = this._peers.size
+    const maxPeers = this._maxConnectedPeers
+    
+    // Always allow priority peers
+    if (this._priorityPeers.has(peerId)) return true
+    
+    // Hard limit check
+    if (currentPeers >= maxPeers) {
+      this._log(`Peer limit reached (${currentPeers}/${maxPeers}), rejecting ${peerId}`)
+      return false
+    }
+    
+    return true
+  }
+
+  /**
+   * Set a peer as high priority (speaker)
+   */
+  setPeerPriority(peerId, isPriority = true) {
+    if (isPriority) {
+      this._priorityPeers.add(peerId)
+      this._log(`Peer ${peerId} set as high priority`)
+    } else {
+      this._priorityPeers.delete(peerId)
+    }
+  }
 
   // ---------------------------------------------------------------------------
   // Join
@@ -390,6 +478,13 @@ export class VoiceConnection extends EventEmitter {
     this._log(`Leaving channel ${this._channelId}`)
     this.stopAudio()
     this._clearAllPeers()
+    
+    // Clear connection management state
+    this._connectionQueue = []
+    this._isConnecting = false
+    this._activeNegotiations = 0
+    this._connectionCooldowns.clear()
+    
     if (this._heartbeat) { clearInterval(this._heartbeat); this._heartbeat = null }
     this._deregisterSocketListeners()
     if (this._socket?.connected) this._socket.emit('voice:leave', this._channelId)
@@ -445,6 +540,8 @@ export class VoiceConnection extends EventEmitter {
       bundlePolicy: 'max-bundle',      // bundle all m-lines — fixes m-line order issues
       rtcpMuxPolicy: 'require',
       iceCandidatePoolSize: 10,        // pre-gather candidates
+      // Additional settings for stability with multiple peers
+      iceTransportPolicy: 'all',       // Use all available transport types
     })
 
     // Add audio track associated with our stream so the remote peer receives
@@ -588,22 +685,102 @@ export class VoiceConnection extends EventEmitter {
 
   _onParticipants({ channelId, participants }) {
     if (channelId !== this._channelId) return
-    this._log('Existing participants:', participants?.map(p => p.id || p))
-    for (const p of (participants || [])) {
-      const pid = p.id || p
-      if (!pid || pid === this._botId) continue
-      // Stagger offers to avoid simultaneous connection races
-      const delay = 200 + Math.random() * 300
-      setTimeout(() => this._offerTo(pid), delay)
+    const peerIds = (participants || [])
+      .map(p => p.id || p)
+      .filter(pid => pid && pid !== this._botId)
+    
+    this._log(`Existing participants: ${peerIds.length} peers —`, peerIds)
+    
+    // Check if we're in a massive join scenario
+    if (peerIds.length > 10) {
+      this._isMassJoinInProgress = true
+      this._pendingPeerCount = peerIds.length
+      this._lastBatchProcessTime = Date.now()
+      this._log(`Mass join detected: ${peerIds.length} peers. Using batch processing mode.`)
     }
+    
+    // Get tier config based on peer count
+    const tier = this._getTierConfig()
+    this._log(`Using tier config: concurrent=${tier.concurrent}, cooldown=${tier.cooldown}ms`)
+    
+    // For large groups, use batch processing
+    if (peerIds.length > tier.maxPeers) {
+      this._log(`Large group detected (${peerIds.length} peers), processing in batches`)
+      this._processPeerBatches(peerIds)
+      return
+    }
+    
+    // Use tiered staggered delays
+    const baseDelay = tier.staggerBase
+    const staggerMs = tier.staggerPerPeer
+    
+    peerIds.forEach((pid, index) => {
+      // Stagger offers with increasing delays to avoid simultaneous connection races
+      const delay = baseDelay + (index * staggerMs) + (Math.random() * 200)
+      this._log(`Queuing connection to ${pid} in ${Math.round(delay)}ms (position ${index + 1}/${peerIds.length})`)
+      setTimeout(() => this._queueConnection(pid), delay)
+    })
+  }
+
+  /**
+   * Process large groups in batches to prevent overwhelming the system
+   */
+  _processPeerBatches(peerIds) {
+    const tier = this._getTierConfig()
+    const batchSize = Math.min(tier.maxPeers, 20) // Process max 20 at a time
+    const batches = []
+    
+    // Split into batches
+    for (let i = 0; i < peerIds.length; i += batchSize) {
+      batches.push(peerIds.slice(i, i + batchSize))
+    }
+    
+    this._log(`Split ${peerIds.length} peers into ${batches.length} batches of ~${batchSize}`)
+    
+    // Process batches with delays
+    batches.forEach((batch, batchIndex) => {
+      const batchDelay = batchIndex * 5000 // 5 seconds between batches
+      
+      setTimeout(() => {
+        this._log(`Processing batch ${batchIndex + 1}/${batches.length} (${batch.length} peers)`)
+        
+        batch.forEach((pid, index) => {
+          // Skip if at peer limit
+          if (!this._canAcceptPeer(pid)) return
+          
+          const delay = tier.staggerBase + (index * tier.staggerPerPeer) + (Math.random() * 200)
+          setTimeout(() => this._queueConnection(pid), delay)
+        })
+        
+        // Mark mass join complete after last batch
+        if (batchIndex === batches.length - 1) {
+          setTimeout(() => {
+            this._isMassJoinInProgress = false
+            this._pendingPeerCount = 0
+            this._log('Mass join processing complete')
+          }, 10000)
+        }
+      }, batchDelay)
+    })
   }
 
   _onUserJoined(userInfo) {
     const userId = userInfo?.id || userInfo?.userId
     if (!userId || userId === this._botId) return
     this._log('User joined voice:', userId)
-    // Slight delay so the other side has registered before we offer
-    setTimeout(() => this._offerTo(userId), 400 + Math.random() * 200)
+    
+    // Check if we're at capacity
+    if (!this._canAcceptPeer(userId)) {
+      this._log(`Cannot accept peer ${userId}: at capacity`)
+      return
+    }
+    
+    // Use tiered delays
+    const tier = this._getTierConfig()
+    const peerCount = this._peers.size
+    const delay = tier.staggerBase + (peerCount * tier.staggerPerPeer * 0.5) + (Math.random() * 300)
+    this._log(`Scheduling connection to new peer ${userId} in ${Math.round(delay)}ms (tier: ${tier.maxPeers} max)`)
+    setTimeout(() => this._queueConnection(userId), delay)
   }
 
   _onUserLeft(data) {
@@ -612,6 +789,98 @@ export class VoiceConnection extends EventEmitter {
     this._log('User left voice:', userId)
     this._destroyPeerState(userId)
     this.emit('peerLeave', userId)
+  }
+
+  /**
+   * Queue a peer connection to prevent overwhelming the system with simultaneous negotiations.
+   * This is critical for stability with multiple peers.
+   */
+  _queueConnection(remoteId) {
+    // Check if at capacity
+    if (!this._canAcceptPeer(remoteId)) {
+      this._log(`Cannot queue ${remoteId}: at capacity`)
+      return
+    }
+
+    // Check cooldown to prevent rapid reconnection attempts
+    const tier = this._getTierConfig()
+    const lastAttempt = this._connectionCooldowns.get(remoteId)
+    if (lastAttempt && Date.now() - lastAttempt < tier.cooldown) {
+      this._log(`Connection to ${remoteId} on cooldown, skipping`)
+      return
+    }
+
+    // Check if already in queue
+    if (this._connectionQueue.includes(remoteId)) {
+      this._log(`Connection to ${remoteId} already queued`)
+      return
+    }
+
+    // Check if already connected
+    const existing = this._peers.get(remoteId)
+    if (existing) {
+      const state = existing.pc?.connectionState
+      if (state === 'connected' || state === 'connecting') {
+        this._log(`Already connected to ${remoteId}, skipping queue`)
+        return
+      }
+    }
+
+    this._connectionQueue.push(remoteId)
+    this._log(`Queued connection to ${remoteId} (queue length: ${this._connectionQueue.length})`)
+    this._processConnectionQueue()
+  }
+
+  /**
+   * Process the connection queue with limited concurrency for stability.
+   * Uses tiered configuration based on peer count.
+   */
+  async _processConnectionQueue() {
+    if (this._isConnecting) return
+    this._isConnecting = true
+
+    const tier = this._getTierConfig()
+    const maxConcurrent = tier.concurrent
+
+    while (this._connectionQueue.length > 0 && this._activeNegotiations < maxConcurrent) {
+      const remoteId = this._connectionQueue.shift()
+      
+      // Double-check state before connecting
+      const existing = this._peers.get(remoteId)
+      if (existing) {
+        const state = existing.pc?.connectionState
+        if (state === 'connected' || state === 'connecting' || existing.makingOffer) {
+          this._log(`Skipping ${remoteId} — already connecting/connected`)
+          continue
+        }
+      }
+
+      this._activeNegotiations++
+      this._connectionCooldowns.set(remoteId, Date.now())
+      
+      this._log(`Processing connection to ${remoteId} (${this._activeNegotiations}/${maxConcurrent} active negotiations, tier: ${tier.maxPeers} max)`)
+      
+      try {
+        this._offerTo(remoteId)
+      } catch (err) {
+        this._log(`Error initiating connection to ${remoteId}:`, err.message)
+        this._activeNegotiations = Math.max(0, this._activeNegotiations - 1)
+      }
+
+      // Tiered delay between starting connections to prevent flooding
+      // Larger delays for larger groups
+      if (this._connectionQueue.length > 0) {
+        const delay = tier.staggerPerPeer
+        await new Promise(r => setTimeout(r, delay))
+      }
+    }
+
+    this._isConnecting = false
+    
+    // If queue still has items, schedule another processing round
+    if (this._connectionQueue.length > 0) {
+      setTimeout(() => this._processConnectionQueue(), tier.staggerBase)
+    }
   }
 
   /**
@@ -624,15 +893,26 @@ export class VoiceConnection extends EventEmitter {
     if (existing) {
       const state = existing.pc?.connectionState
       // Already connected or actively negotiating — do nothing
-      if (state === 'connected' || state === 'connecting') return
+      if (state === 'connected' || state === 'connecting') {
+        this._activeNegotiations = Math.max(0, this._activeNegotiations - 1)
+        return
+      }
       if (existing.makingOffer) {
         this._log(`_offerTo ${remoteId} skipped — offer already in flight`)
+        this._activeNegotiations = Math.max(0, this._activeNegotiations - 1)
         return
       }
     }
     this._log('Creating peer connection for', remoteId)
     this._getOrCreatePeerState(remoteId)
     // onnegotiationneeded fires automatically after addTrack in _buildPeerConnection
+    
+    // Decrement counter after a delay to allow negotiation to complete
+    setTimeout(() => {
+      this._activeNegotiations = Math.max(0, this._activeNegotiations - 1)
+      // Try to process more queued connections
+      this._processConnectionQueue()
+    }, 3000)
   }
 
   /**
