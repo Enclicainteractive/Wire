@@ -135,7 +135,12 @@ export class Client extends EventEmitter {
           })
         }
 
+        // Set online status immediately via socket for instant UI update
+        this.socket.emit('bot:status-change', { status: 'online', customStatus: null })
+        // Also persist via REST
         this.rest.setStatus(BotStatus.ONLINE).catch(() => {})
+        this._log('Bot status set to online')
+        
         this.emit('ready', this.bot)
         resolve(this.bot)
       })

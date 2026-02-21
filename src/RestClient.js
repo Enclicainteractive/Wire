@@ -146,6 +146,14 @@ export class RestClient {
   }
 
   /**
+   * Get members of a voice channel.
+   * @param {string} channelId
+   */
+  async getChannelMembers(channelId) {
+    return this._request('GET', `/api/bots/api/channels/${channelId}/members`)
+  }
+
+  /**
    * Send a typing indicator in a channel.
    * @param {string} channelId
    */
