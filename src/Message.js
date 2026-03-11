@@ -5,7 +5,7 @@ export class Message {
     this.serverId    = data.serverId   || null
     this.userId      = data.userId
     this.username    = data.username
-    this.host        = data.host       || null  // originating server host of the author
+    this.host        = data.host       || null
     this.avatar      = data.avatar     || null
     this.content     = data.content    || ''
     this.embeds      = data.embeds     || []
@@ -16,6 +16,10 @@ export class Message {
     this.replyTo     = data.replyTo    || null
     this.timestamp   = data.timestamp ? new Date(data.timestamp) : new Date()
     this.edited      = data.edited     || false
+    this.encrypted   = data.encrypted  || false
+    this.iv          = data.iv         || null
+    this.epoch       = data.epoch      || null
+    this.keyVersion  = data.keyVersion || null
     this._client     = client
   }
 
@@ -198,7 +202,9 @@ export class Message {
       content: this.content, embeds: this.embeds, attachments: this.attachments,
       mentions: this.mentions,
       bot: this.bot, pinned: this.pinned, replyTo: this.replyTo,
-      timestamp: this.timestamp.toISOString(), edited: this.edited
+      timestamp: this.timestamp.toISOString(), edited: this.edited,
+      encrypted: this.encrypted, iv: this.iv,
+      epoch: this.epoch, keyVersion: this.keyVersion
     }
   }
 }

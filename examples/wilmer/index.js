@@ -699,8 +699,19 @@ bot.commands.add({
         }
 
         let vc
+        let encryptionEnabled = true
+        
+        // Check if server has E2EE enabled
         try {
-          vc = await bot.joinVoice(serverId, channelId)
+          const encryptionStatus = await bot.rest.getServerEncryptionStatus(serverId)
+          encryptionEnabled = encryptionStatus?.enabled ?? true
+          console.log(`[Wilmer] Server encryption status: ${encryptionEnabled ? 'enabled' : 'disabled'}`)
+        } catch (err) {
+          console.log(`[Wilmer] Could not get encryption status, defaulting to encrypted: ${err.message}`)
+        }
+        
+        try {
+          vc = await bot.joinVoice(serverId, channelId, { encrypted: encryptionEnabled })
         } catch (err) {
           console.error('[Wilmer] joinVoice error:', err.message)
           return message.reply(`Failed to join voice: ${err.message}`)
@@ -737,7 +748,7 @@ bot.commands.add({
           console.log(`[Wilmer] Peer left voice: ${peerId}`)
         })
 
-        await message.reply(`Joined voice channel \`${channelId}\`. Use \`!play <file or url>\` to play audio.`)
+        await message.reply(`Joined voice channel \`${channelId}\` (Encryption: ${encryptionEnabled ? 'enabled' : 'disabled'}). Use \`!play <file or url>\` to play audio.`)
   }
 })
 
@@ -793,8 +804,17 @@ bot.commands.add({
           const voiceChannel = channels?.find(c => c.name?.toLowerCase().includes('general') || c.name?.toLowerCase().includes('voice'))
           if (!voiceChannel) return message.reply('No voice channel found. Use `!joinvoice <channel>` first.')
           
+          // Check server encryption status
+          let encryptionEnabled = true
           try {
-            vc = await bot.joinVoice(serverId, voiceChannel.id)
+            const encryptionStatus = await bot.rest.getServerEncryptionStatus(serverId)
+            encryptionEnabled = encryptionStatus?.enabled ?? true
+          } catch (err) {
+            console.log(`[Wilmer] Could not get encryption status: ${err.message}`)
+          }
+          
+          try {
+            vc = await bot.joinVoice(serverId, voiceChannel.id, { encrypted: encryptionEnabled })
           } catch (err) {
             return message.reply(`Failed to join voice: ${err.message}`)
           }
@@ -1397,7 +1417,12 @@ bot.commands.add({
               const channels = await bot.fetchChannels(message.serverId).catch(() => [])
               const voiceChannel = channels?.find(c => c.name?.toLowerCase().includes('general') || c.name?.toLowerCase().includes('voice'))
               if (voiceChannel) {
-                vc = await bot.joinVoice(message.serverId, voiceChannel.id)
+                let encryptionEnabled = true
+                try {
+                  const encryptionStatus = await bot.rest.getServerEncryptionStatus(message.serverId)
+                  encryptionEnabled = encryptionStatus?.enabled ?? true
+                } catch (err) {}
+                vc = await bot.joinVoice(message.serverId, voiceChannel.id, { encrypted: encryptionEnabled })
               }
             }
             if (vc) {
@@ -1477,7 +1502,12 @@ bot.commands.add({
               const channels = await bot.fetchChannels(message.serverId).catch(() => [])
               const voiceChannel = channels?.find(c => c.name?.toLowerCase().includes('general') || c.name?.toLowerCase().includes('voice'))
               if (voiceChannel) {
-                vc = await bot.joinVoice(message.serverId, voiceChannel.id)
+                let encryptionEnabled = true
+                try {
+                  const encryptionStatus = await bot.rest.getServerEncryptionStatus(message.serverId)
+                  encryptionEnabled = encryptionStatus?.enabled ?? true
+                } catch (err) {}
+                vc = await bot.joinVoice(message.serverId, voiceChannel.id, { encrypted: encryptionEnabled })
               }
             }
             if (vc) {
@@ -1542,7 +1572,12 @@ bot.commands.add({
           const channels = await bot.fetchChannels(message.serverId).catch(() => [])
           const voiceChannel = channels?.find(c => c.name?.toLowerCase().includes('general') || c.name?.toLowerCase().includes('voice'))
           if (!voiceChannel) return message.reply('No voice channel found. Use `!joinvoice` first.')
-          vc = await bot.joinVoice(message.serverId, voiceChannel.id)
+          let encryptionEnabled = true
+          try {
+            const encryptionStatus = await bot.rest.getServerEncryptionStatus(message.serverId)
+            encryptionEnabled = encryptionStatus?.enabled ?? true
+          } catch (err) {}
+          vc = await bot.joinVoice(message.serverId, voiceChannel.id, { encrypted: encryptionEnabled })
         }
 
         // Validate and normalize extension
@@ -1730,7 +1765,12 @@ bot.commands.add({
           const channels = await bot.fetchChannels(message.serverId).catch(() => [])
           const voiceChannel = channels?.find(c => c.name?.toLowerCase().includes('general') || c.name?.toLowerCase().includes('voice'))
           if (!voiceChannel) return message.reply('No voice channel found. Use `!joinvoice` first.')
-          vc = await bot.joinVoice(message.serverId, voiceChannel.id)
+          let encryptionEnabled = true
+          try {
+            const encryptionStatus = await bot.rest.getServerEncryptionStatus(message.serverId)
+            encryptionEnabled = encryptionStatus?.enabled ?? true
+          } catch (err) {}
+          vc = await bot.joinVoice(message.serverId, voiceChannel.id, { encrypted: encryptionEnabled })
         }
 
         const name = `attach_${Date.now()}.${ext}`

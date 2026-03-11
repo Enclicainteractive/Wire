@@ -7,4 +7,8 @@ export { WebhookServer }                        from './WebhookServer.js'
 export { EventEmitter }                         from './EventEmitter.js'
 export { Collection }                           from './Collection.js'
 export { VoiceConnection }                      from './VoiceConnection.js'
+export { MessageTracker }                       from './MessageTracker.js'
+export { WireCUI }                              from './WireCUI.js'
 export { GatewayEvents, Intents, Permissions, BotStatus } from './constants.js'
+
+export * as Encryption from './Encryption.js'

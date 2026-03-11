@@ -276,4 +276,65 @@ export class RestClient {
   async setStatus(status, customStatus) {
     return this._request('PUT', '/api/bots/api/status', { status, ...(customStatus ? { customStatus } : {}) })
   }
+
+  // -------------------------------------------------------------------------
+  // E2EE (Encryption)
+  // -------------------------------------------------------------------------
+
+  /**
+   * Get the encryption status for a server.
+   * @param {string} serverId
+   */
+  async getServerEncryptionStatus(serverId) {
+    return this._request('GET', `/api/bots/api/e2e/status/${serverId}`)
+  }
+
+  /**
+   * Get the encrypted key for a server for the current bot.
+   * @param {string} serverId
+   */
+  async getUserKeysForServer(serverId) {
+    return this._request('GET', `/api/bots/api/e2e/user/keys/${serverId}`)
+  }
+
+  /**
+   * Get the auto-enrollment key for a server.
+   * @param {string} serverId
+   */
+  async getServerAutoKey(serverId) {
+    return this._request('GET', `/api/bots/api/e2e/auto-key/${serverId}`)
+  }
+
+  /**
+   * Join a server's encryption.
+   * @param {string} serverId
+   * @param {object} data - Contains the decrypted symmetric key
+   */
+  async joinE2eServer(serverId, data) {
+    return this._request('POST', `/api/bots/api/e2e/join/${serverId}`, data)
+  }
+
+  /**
+   * Leave a server's encryption.
+   * @param {string} serverId
+   */
+  async leaveE2eServer(serverId) {
+    return this._request('POST', `/api/bots/api/e2e/join/${serverId}`)
+  }
+
+  /**
+   * Get the server's public key info.
+   * @param {string} serverId
+   */
+  async getServerPublicKey(serverId) {
+    return this._request('GET', `/api/bots/api/e2e/public-key/${serverId}`)
+  }
+
+  /**
+   * Get encryption join info for a server.
+   * @param {string} serverId
+   */
+  async getJoinInfo(serverId) {
+    return this._request('GET', `/api/bots/api/e2e/join-info/${serverId}`)
+  }
 }

@@ -1,11 +1,15 @@
 import { EventEmitter } from './EventEmitter.js'
 import { createRequire } from 'module'
-import { spawn } from 'child_process'
-import { spawnSync } from 'child_process'
 import path from 'path'
-import fs from 'fs'
+import { AudioPlayer } from './voice/AudioPlayer.js'
+import { VideoPlayer } from './voice/VideoPlayer.js'
+import { StreamPlayer } from './voice/StreamPlayer.js'
+import { DualStreamPlayer } from './voice/DualStreamPlayer.js'
+import { PeerState } from './voice/PeerState.js'
+import { isHttpInput, sanitizeMediaInput } from './voice/mediaUtils.js'
 
 const require = createRequire(import.meta.url)
+const DEFAULT_DUALSTREAM_NO_MEDIA_TIMEOUT_MS = 5500
 
 function loadWrtc() {
   try {
@@ -52,1045 +56,6 @@ function buildIceServers(extraServers = []) {
 
   return [...servers, ...extraServers]
 }
-
-const SAMPLE_RATE    = 48000
-const CHANNELS       = 1
-const BITS           = 16
-const FRAME_DURATION = 10
-const FRAME_SAMPLES  = (SAMPLE_RATE * FRAME_DURATION) / 1000
-const FRAME_BYTES    = FRAME_SAMPLES * CHANNELS * (BITS / 8)
-
-const VIDEO_WIDTH   = 640
-const VIDEO_HEIGHT  = 360
-const VIDEO_FPS      = 30
-const LOW_LATENCY_MAX_VIDEO_BUFFER_FRAMES = 8
-const LOW_LATENCY_START_BUFFER_FRAMES = 2
-const LOW_LATENCY_START_DELAY_MS = 0
-const LOW_LATENCY_RESUME_DELAY_MS = 100
-const LOW_LATENCY_RESYNC_DELAY_MS = 120
-const LOW_LATENCY_MAX_CORRECTION_DELAY_MS = 25
-const RTC_DELAY_MS = 0
-const MAX_PLAYER_RETRY_ATTEMPTS = 3
-const MAX_STREAM_BUFFER_FRAMES = 48
-const MAX_STREAM_TARGET_BUFFER_FRAMES = 6
-const MAX_VIDEO_BUFFER_FRAMES = 240
-const MAX_VIDEO_TARGET_BUFFER_FRAMES = 4
-const FFMPEG_RETRY_BACKOFF_MS = 1200
-
-function parseFpsValue(raw) {
-  if (!raw || typeof raw !== 'string') return null
-  const trimmed = raw.trim()
-  if (!trimmed || trimmed === '0/0') return null
-  if (trimmed.includes('/')) {
-    const [n, d] = trimmed.split('/').map(Number)
-    if (!Number.isFinite(n) || !Number.isFinite(d) || d === 0) return null
-    const fps = n / d
-    return Number.isFinite(fps) && fps > 1 && fps < 240 ? fps : null
-  }
-  const fps = Number(trimmed)
-  return Number.isFinite(fps) && fps > 1 && fps < 240 ? fps : null
-}
-
-function detectInputFpsSync(input, isUrl = false) {
-  try {
-    const args = ['-v', 'error']
-    if (isUrl) {
-      args.push(
-        '-rw_timeout', '8000000',
-        '-user_agent', 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'
-      )
-    }
-    args.push(
-      '-select_streams', 'v:0',
-      '-show_entries', 'stream=avg_frame_rate,r_frame_rate',
-      '-of', 'default=noprint_wrappers=1:nokey=1',
-      input
-    )
-    const result = spawnSync('ffprobe', args, { encoding: 'utf8', timeout: isUrl ? 5000 : 3000 })
-    if (result.error || result.status !== 0) return null
-    const lines = (result.stdout || '').split('\n').map(l => l.trim()).filter(Boolean)
-    for (const line of lines) {
-      const fps = parseFpsValue(line)
-      if (fps) return fps
-    }
-    return null
-  } catch {
-    return null
-  }
-}
-
-function isHttpInput(input) {
-  return typeof input === 'string' && /^(https?):\/\//i.test(input.trim())
-}
-
-function sanitizeMediaInput(input) {
-  const normalized = typeof input === 'string' ? input.trim() : ''
-  if (!normalized) return null
-  if (isHttpInput(normalized)) return normalized
-  return normalized
-}
-
-function buildHttpInputArgs(input, userAgent) {
-  const headers = [
-    'User-Agent: ' + userAgent,
-    'Accept: */*',
-    'Accept-Language: en-US,en;q=0.9',
-    'Connection: keep-alive'
-  ]
-
-  return [
-    '-rw_timeout', '15000000',
-    '-reconnect', '1',
-    '-reconnect_streamed', '1',
-    '-reconnect_at_eof', '1',
-    '-reconnect_on_network_error', '1',
-    '-reconnect_delay_max', '8',
-    '-user_agent', userAgent,
-    '-headers', headers.join('\r\n') + '\r\n',
-    '-i', input
-  ]
-}
-
-function buildAudioFilter(effect) {
-  if (!effect || !effect.enabled || effect.type === 'none') return null
-  
-  const filters = []
-  
-  if (effect.pitch !== 0) {
-    const speed = Math.pow(2, effect.pitch / 12)
-    filters.push(`atempo=${speed}`)
-  }
-  
-  if (effect.reverb > 0) {
-    filters.push(`aecho=0.8:0.9:${effect.reverb / 100}:0.5`)
-  }
-  
-  if (effect.distortion > 0) {
-    filters.push(`acompressor=threshold=-20dB:ratio=4:attack=5:release=50`)
-  }
-  
-  if (effect.echo > 0) {
-    filters.push(`aecho=0.8:0.88:${effect.echo / 200}:0.4`)
-  }
-  
-  if (effect.tremolo > 0) {
-    filters.push(`vibrato=f=${effect.tremolo / 10}:d=0.5`)
-  }
-  
-  if (effect.robot) {
-    filters.push(`afftfilt=real='hypot(re,im)*sin(0)':imag='hypot(re,im)*cos(0)':win_size=512:overlap=0.75`)
-  }
-  
-  if (effect.alien) {
-    filters.push(`afftfilt=real='cosh(0)*sin(0)':imag='cosh(0)*cos(0)':win_size=512:overlap=0.75`)
-  }
-  
-  return filters.length > 0 ? filters.join(',') : null
-}
-
-class AudioPlayer extends EventEmitter {
-  constructor(audioSource, filePath, loop = false, effect = null) {
-    super()
-    this._source     = audioSource
-    this._filePath   = filePath
-    this._loop       = loop
-    this._effect     = effect || { enabled: false, type: 'none', pitch: 0, reverb: 0, distortion: 0, echo: 0, tremolo: 0, robot: false, alien: false }
-    this._ffmpeg     = null
-    this._timer      = null
-    this._buf        = Buffer.alloc(0)
-    this._stopped    = false
-    this._paused     = true
-    this._volume     = 1.0
-    this._framesSent = 0
-    this._startTime  = null
-    this._pausedTime = 0
-    this._pauseStart = null
-    this._bufferFrameCount = 0
-    this._maxBufferFrames = LOW_LATENCY_MAX_VIDEO_BUFFER_FRAMES
-  }
-
-  start() {
-    this._stopped    = false
-    this._paused     = true
-    this._framesSent = 0
-    this._startTime  = null
-    this._pausedTime = 0
-    this._pauseStart = null
-    this._bufferFrameCount = 0
-    this._spawnFfmpeg()
-  }
-
-  _spawnFfmpeg() {
-    if (this._stopped) return
-    if (!fs.existsSync(this._filePath)) {
-      this.emit('error', new Error(`Audio file not found: ${this._filePath}`))
-      return
-    }
-    
-    const args = [
-      '-re',
-      '-loglevel', 'warning',
-      '-i', this._filePath,
-      '-f', 's16le',
-      '-ar', String(SAMPLE_RATE),
-      '-ac', String(CHANNELS),
-    ]
-
-    const filter = buildAudioFilter(this._effect)
-    if (filter) {
-      const outputIndex = args.indexOf('-f')
-      args.splice(outputIndex > 0 ? outputIndex : args.length, 0, '-af', filter)
-    }
-
-    args.push('pipe:1')
-
-    this._ffmpeg = spawn('ffmpeg', args)
-
-    const frameSize = FRAME_BYTES
-    this._ffmpeg.stdout.on('data', (chunk) => {
-      this._buf = Buffer.concat([this._buf, chunk])
-      const maxStartupFrames = Math.max(1, LOW_LATENCY_START_BUFFER_FRAMES)
-      const frameLimit = this._paused && !this._startTime
-        ? maxStartupFrames
-        : (this._paused ? this._maxBufferFrames : null)
-      if (this._paused) {
-        this._bufferFrameCount = Math.floor(this._buf.length / frameSize)
-      }
-      if (frameLimit) {
-        const maxBytes = frameSize * frameLimit
-        if (this._buf.length > maxBytes) {
-          this._buf = this._buf.slice(this._buf.length - maxBytes)
-          this._bufferFrameCount = frameLimit
-        }
-      }
-    })
-
-    this._ffmpeg.stderr.on('data', (d) => {
-      const msg = d.toString().trim()
-      if (msg) console.warn('[Wire/Voice/Audio] ffmpeg:', msg)
-    })
-
-    this._ffmpeg.on('close', (code) => {
-      console.log(`[Wire/Voice/Audio] ffmpeg closed (code=${code})`)
-      if (!this._stopped && this._loop) {
-        this._buf = Buffer.alloc(0)
-        this._spawnFfmpeg()
-      } else {
-        this._drainAndFinish()
-      }
-    })
-
-    this._ffmpeg.on('error', (err) => {
-      console.error('[Wire/Voice/Audio] ffmpeg error:', err.message)
-      this.emit('error', err)
-    })
-  }
-
-  unpause(baseStartTime = null) {
-    if (!this._paused) return
-    const now = Number.isFinite(baseStartTime) ? baseStartTime : Date.now()
-    this._paused = false
-    if (this._pauseStart) {
-      this._pausedTime += now - this._pauseStart
-      this._pauseStart = null
-    }
-    if (!this._startTime) {
-      this._startTime = now
-    }
-    if (!this._timer && !this._stopped) {
-      this._timer = setInterval(() => this._pump(), FRAME_DURATION)
-    }
-  }
-
-  pause() {
-    this._paused = true
-    this._pauseStart = Date.now()
-    if (this._timer) {
-      clearInterval(this._timer)
-      this._timer = null
-    }
-  }
-
-  getPosition() {
-    if (!this._startTime || this._paused) return 0
-    
-    // RTC has ~100ms inherent delay, use wall clock for first 3 seconds
-    // then switch to frame count to prevent drift
-    const elapsedMs = Date.now() - this._startTime - this._pausedTime
-    
-    if (elapsedMs < 3000) {
-      // Initial phase: use wall clock (accurate at start)
-      return elapsedMs + RTC_DELAY_MS
-    } else {
-      // Steady state: use frame count to prevent drift
-      const msPosition = (this._framesSent * FRAME_SAMPLES) / SAMPLE_RATE * 1000 + RTC_DELAY_MS
-      return msPosition
-    }
-  }
-
-  _pump() {
-    if (this._stopped || this._paused) return
-    if (this._buf.length < FRAME_BYTES) return
-
-    const frameData = Buffer.alloc(FRAME_BYTES)
-    this._buf.copy(frameData, 0, 0, FRAME_BYTES)
-    this._buf = this._buf.slice(FRAME_BYTES)
-
-    let samples = new Int16Array(frameData.buffer, frameData.byteOffset, FRAME_SAMPLES)
-    if (this._volume !== 1.0) {
-      const floatSamples = new Float32Array(FRAME_SAMPLES)
-      for (let i = 0; i < FRAME_SAMPLES; i++) {
-        floatSamples[i] = (samples[i] / 32768) * this._volume
-      }
-      samples = new Int16Array(FRAME_SAMPLES)
-      for (let i = 0; i < FRAME_SAMPLES; i++) {
-        const val = Math.max(-1, Math.min(1, floatSamples[i]))
-        samples[i] = Math.round(val * 32767)
-      }
-    }
-
-    try {
-      this._source.onData({
-        samples,
-        sampleRate: SAMPLE_RATE,
-        bitsPerSample: BITS,
-        channelCount: CHANNELS,
-        numberOfFrames: FRAME_SAMPLES,
-      })
-      this._framesSent++
-    } catch (err) {
-      console.error('[Wire/Voice/Audio] Error sending frame:', err.message)
-    }
-  }
-
-  stop() {
-    this._stopped = true
-    this._paused = true
-    this._startTime = null
-    this._pausedTime = 0
-    this._pauseStart = null
-    if (this._ffmpeg) { try { this._ffmpeg.kill() } catch {} ; this._ffmpeg = null }
-    if (this._timer) { clearInterval(this._timer); this._timer = null }
-    this._buf = Buffer.alloc(0)
-  }
-
-  _drainAndFinish() {
-    if (this._buf.length < FRAME_BYTES) {
-      this._paused = true
-      this.emit('finish')
-      return
-    }
-    this._pump()
-    setTimeout(() => this._drainAndFinish(), FRAME_DURATION)
-  }
-
-  setVolume(vol) {
-    this._volume = vol
-  }
-}
-
-class VideoPlayer extends EventEmitter {
-  constructor(videoSource, filePath, loop = false) {
-    super()
-    this._source     = videoSource
-    this._filePath   = sanitizeMediaInput(filePath)
-    this._loop       = loop
-    this._ffmpeg     = null
-    this._timer      = null
-    this._retryTimer = null
-    this._buf        = Buffer.alloc(0)
-    this._stopped    = false
-    this._paused     = true
-    this._framesSent = 0
-    this._width      = VIDEO_WIDTH
-    this._height     = VIDEO_HEIGHT
-    this._startTime  = null
-    this._pausedTime = 0 // Total time spent paused (for wall-clock position)
-    this._pauseStart = null // When we paused (to track paused duration)
-    this._isUrl      = isHttpInput(this._filePath)
-    
-    // Sync tracking
-    this._lastFrameTime = null
-    this._frameIntervals = []
-    this._stutterCount = 0
-    this._lastFrameSendTime = 0
-    this._bufferFrameCount = 0
-    this._hasStartedPlayback = false
-    this._suppressNextClose = false
-    
-    // Config
-    this._maxBufferFrames = LOW_LATENCY_MAX_VIDEO_BUFFER_FRAMES
-    this._stutterThresholdMs = 50 // If frame takes >50ms, it's a stutter
-    this._targetFPS = VIDEO_FPS
-    this._frameIntervalMs = 1000 / this._targetFPS
-    this._ffmpegInitialized = false // Track if ffmpeg has properly started
-    this._retryCount = 0
-    this._lastFfmpegError = ''
-    this._debugLabel = 'Video'
-    this._trimLogCooldownMs = 1200
-    this._lastTrimLogAt = 0
-    this._pendingTrimFrames = 0
-    this._decodedFrames = 0
-  }
-
-  start() {
-    this._stopped    = false
-    this._paused     = true
-    this._framesSent = 0
-    this._startTime  = null
-    this._hasStartedPlayback = false
-    this._suppressNextClose = false
-    this._ffmpegInitialized = false
-    this._retryCount = 0
-    this._lastFfmpegError = ''
-    this._decodedFrames = 0
-    const detectedFps = detectInputFpsSync(this._filePath, this._isUrl)
-    this._targetFPS = detectedFps || VIDEO_FPS
-    this._frameIntervalMs = 1000 / this._targetFPS
-    this._stutterThresholdMs = Math.max(45, this._frameIntervalMs * 2.2)
-    this._log(`Video target FPS set to ${this._targetFPS.toFixed(2)}${detectedFps ? ' (source-detected)' : ' (fallback)'}`)
-    if (this._retryTimer) { clearTimeout(this._retryTimer); this._retryTimer = null }
-    // Spawn lazily on first unpause to avoid startup kill/restart races.
-    this._ffmpegInitialized = false
-    if (this._ffmpeg) { try { this._ffmpeg.kill() } catch {} ; this._ffmpeg = null }
-    this._buf = Buffer.alloc(0)
-    this._bufferFrameCount = 0
-  }
-
-  _spawnFfmpeg() {
-    if (this._stopped) return
-    if (!this._filePath) {
-      this.emit('error', new Error('Video input path/url is empty'))
-      return
-    }
-    if (!this._isUrl && !fs.existsSync(this._filePath)) {
-      this.emit('error', new Error(`Video file not found: ${this._filePath}`))
-      return
-    }
-    
-    // Reset initialization state for new ffmpeg instance
-    this._ffmpegInitialized = false
-
-    const inputArgs = this._isUrl
-      ? ['-re', ...buildHttpInputArgs(this._filePath, 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36')]
-      : ['-re', '-i', this._filePath]
-
-    const args = [
-      '-loglevel', 'warning',
-      '-fflags', 'nobuffer',
-      '-flags', 'low_delay',
-      '-analyzeduration', '500000',
-      '-probesize', '1000000',
-      ...inputArgs,
-      '-an',
-      '-vf', 'scale=' + this._width + ':' + this._height + ':force_original_aspect_ratio=decrease:force_divisible_by=2,pad=' + this._width + ':' + this._height + ':(ow-iw)/2:(oh-ih)/2,setsar=1',
-      '-c:v', 'rawvideo',
-      '-pix_fmt', 'yuv420p',
-      '-f', 'rawvideo',
-      'pipe:1'
-    ]
-    this._ffmpeg = spawn('ffmpeg', args)
-
-    const frameSize = this._width * this._height * 3 / 2
-
-    this._ffmpeg.stdout.on('data', (chunk) => {
-      // Mark ffmpeg as initialized once we start receiving data
-      if (!this._ffmpegInitialized && chunk.length >= frameSize) {
-        this._ffmpegInitialized = true
-        this._retryCount = 0
-        this._log('Video decoder initialized')
-      }
-      if (chunk.length > 0) {
-        this._decodedFrames += Math.floor(chunk.length / frameSize)
-      }
-      
-      this._buf = Buffer.concat([this._buf, chunk])
-      const maxBufferBytes = frameSize * MAX_VIDEO_BUFFER_FRAMES
-      if (this._buf.length > maxBufferBytes) {
-        const dropped = Math.floor((this._buf.length - maxBufferBytes) / frameSize)
-        this._buf = this._buf.slice(this._buf.length - maxBufferBytes)
-        if (dropped > 0) {
-          this._pendingTrimFrames += dropped
-          const now = Date.now()
-          if ((now - this._lastTrimLogAt) >= this._trimLogCooldownMs) {
-            this._log(`Trimmed oversized video buffer by ${this._pendingTrimFrames} frames`)
-            this._pendingTrimFrames = 0
-            this._lastTrimLogAt = now
-          }
-        }
-      }
-      this._bufferFrameCount = Math.floor(this._buf.length / frameSize)
-    })
-
-    this._ffmpeg.stderr.on('data', (d) => {
-      const msg = d.toString().trim()
-      if (msg) {
-        this._lastFfmpegError = msg
-        console.warn('[Wire/Voice/Video] ffmpeg:', msg)
-      }
-    })
-
-    this._ffmpeg.on('close', (code) => {
-      if (this._suppressNextClose) {
-        this._suppressNextClose = false
-        return
-      }
-      console.log(`[Wire/Voice/Video] ffmpeg closed (code=${code})`)
-      const hadOutput = this._ffmpegInitialized || this._decodedFrames > 0 || this._buf.length >= frameSize
-      const emptyClose = !hadOutput
-      const shouldRetry = !this._stopped && this._isUrl && (code !== 0 || emptyClose) && this._retryCount < MAX_PLAYER_RETRY_ATTEMPTS
-      if (shouldRetry) {
-        this._retryCount++
-        this._log(`Retrying video ffmpeg after close (attempt ${this._retryCount}/${MAX_PLAYER_RETRY_ATTEMPTS}, code=${code}, empty=${emptyClose})`)
-        this._retryTimer = setTimeout(() => this._spawnFfmpeg(), FFMPEG_RETRY_BACKOFF_MS * this._retryCount)
-        return
-      }
-      if (!this._stopped && (code !== 0 || emptyClose) && !hadOutput) {
-        this.emit('error', new Error(`Video ffmpeg exited before initialization (code=${code}): ${this._lastFfmpegError || 'unknown error'}`))
-        return
-      }
-      if (!this._stopped && this._loop) {
-        this._buf = Buffer.alloc(0)
-        this._spawnFfmpeg()
-      } else {
-        this._paused = true
-        this.emit('finish')
-      }
-    })
-
-    this._ffmpeg.on('error', (err) => {
-      console.error('[Wire/Voice/Video] ffmpeg error:', err.message)
-      this._lastFfmpegError = err.message
-      if (this._retryCount < MAX_PLAYER_RETRY_ATTEMPTS) {
-        this._retryCount++
-        this._log(`Retrying ffmpeg (attempt ${this._retryCount}/${MAX_PLAYER_RETRY_ATTEMPTS})`)
-        this._retryTimer = setTimeout(() => this._spawnFfmpeg(), FFMPEG_RETRY_BACKOFF_MS * this._retryCount)
-      } else {
-        this._retryCount = 0
-        this.emit('error', err)
-      }
-    })
-  }
-
-  _log(...args) {
-    console.log(`[Wire/Voice/${this._debugLabel}]`, ...args)
-  }
-
-  prime() {
-    if (this._stopped) return
-    if (!this._ffmpeg) this._spawnFfmpeg()
-  }
-
-  unpause(baseStartTime = null) {
-    if (!this._paused) return
-    const now = Number.isFinite(baseStartTime) ? baseStartTime : Date.now()
-
-    // Ensure first playback starts from the beginning of the source.
-    if (!this._hasStartedPlayback) {
-      this._hasStartedPlayback = true
-    }
-    if (!this._ffmpeg) {
-      this._buf = Buffer.alloc(0)
-      this._bufferFrameCount = 0
-      this._spawnFfmpeg()
-    }
-
-    this._paused = false
-    
-    // Track paused time for accurate wall-clock position
-    if (this._pauseStart) {
-      this._pausedTime += now - this._pauseStart
-      this._pauseStart = null
-    }
-    
-    // Initialize start time on first unpause
-    if (!this._startTime) {
-      this._startTime = now
-    }
-    
-    this._lastFrameTime = now
-    this._lastFrameSendTime = now
-    this._bufferFrameCount = 0
-    if (!this._timer && !this._stopped) {
-      // Use setInterval at the target FPS for consistent timing
-      this._timer = setInterval(() => this._pump(), Math.round(1000 / this._targetFPS))
-    }
-  }
-
-  pause() {
-    this._paused = true
-    this._pauseStart = Date.now() // Track when we paused
-    if (this._timer) {
-      clearInterval(this._timer)
-      this._timer = null
-    }
-  }
-
-  _pump() {
-    if (this._stopped || this._paused) return
-    
-    const frameSize = this._width * this._height * 3 / 2
-    if (this._buf.length < frameSize) return
-
-    const now = Date.now()
-    
-    // Track buffer size (how many frames are buffered)
-    this._bufferFrameCount = Math.floor(this._buf.length / frameSize)
-    if (this._bufferFrameCount > MAX_VIDEO_TARGET_BUFFER_FRAMES) {
-      const staleFrames = this._bufferFrameCount - MAX_VIDEO_TARGET_BUFFER_FRAMES
-      this._buf = this._buf.slice(staleFrames * frameSize)
-      this._bufferFrameCount = Math.floor(this._buf.length / frameSize)
-      this._pendingTrimFrames += staleFrames
-      const nowTrim = Date.now()
-      if ((nowTrim - this._lastTrimLogAt) >= this._trimLogCooldownMs && this._pendingTrimFrames > 0) {
-        this._log(`Dropped ${this._pendingTrimFrames} stale video frames for low-latency catch-up`)
-        this._pendingTrimFrames = 0
-        this._lastTrimLogAt = nowTrim
-      }
-      if (this._buf.length < frameSize) return
-    }
-    
-    // STUTTER DETECTION: Track time between frames
-    if (this._lastFrameSendTime > 0) {
-      const interval = now - this._lastFrameSendTime
-      
-      // Track frame intervals for jitter analysis
-      this._frameIntervals.push(interval)
-      if (this._frameIntervals.length > 30) {
-        this._frameIntervals.shift()
-      }
-      
-      // Detect stutter: if frame took much longer than expected
-      if (interval > this._stutterThresholdMs) {
-        this._stutterCount++
-        // Emit stutter event for sync manager to handle
-        this.emit('stutter', { interval, stutterCount: this._stutterCount })
-      }
-    }
-    this._lastFrameSendTime = now
-
-    // Frame-count pacing with bounded catch-up: if event loop lags, send up to 2
-    // frames in one tick to reduce perceived jitter without huge bursts.
-    const elapsedMs = this._startTime ? (Date.now() - this._startTime - this._pausedTime) : 0
-    const expectedFrames = Math.max(1, Math.floor((elapsedMs / 1000) * this._targetFPS))
-    const framesDue = Math.max(1, Math.min(2, expectedFrames - this._framesSent))
-
-    for (let i = 0; i < framesDue; i++) {
-      if (this._buf.length < frameSize) break
-      this._framesSent++
-      const frameData = Buffer.alloc(frameSize)
-      this._buf.copy(frameData, 0, 0, frameSize)
-      this._buf = this._buf.slice(frameSize)
-      this._bufferFrameCount = Math.max(0, this._bufferFrameCount - 1)
-      try {
-        const videoFrame = {
-          width: this._width,
-          height: this._height,
-          data: new Uint8ClampedArray(frameData),
-        }
-        this._source.onFrame(videoFrame)
-      } catch (err) {
-        console.error('[Wire/Voice/Video] Error sending frame:', err.message)
-        break
-      }
-    }
-  }
-  
-  // Get current video position - hybrid approach for RTC delay compensation
-  // Initially uses wall clock (accurate at start), then switches to frame count (no drift)
-  getPosition() {
-    if (!this._startTime || this._paused) return 0
-    
-    // RTC has ~100ms inherent delay, use wall clock for first 3 seconds
-    // then switch to frame count to prevent drift
-    const elapsedMs = Date.now() - this._startTime - this._pausedTime
-    
-    if (elapsedMs < 3000) {
-      // Initial phase: use wall clock (accurate at start)
-      return elapsedMs + RTC_DELAY_MS
-    } else {
-      // Steady state: use frame count to prevent drift
-      const frameDurationMs = 1000 / this._targetFPS
-      return Math.floor(this._framesSent * frameDurationMs) + RTC_DELAY_MS
-    }
-  }
-  
-  // Get buffer status
-  getBufferStatus() {
-    return {
-      bufferedFrames: this._bufferFrameCount,
-      framesSent: this._framesSent,
-      stutterCount: this._stutterCount,
-      targetFps: this._targetFPS,
-      avgFrameInterval: this._frameIntervals.length > 0 
-        ? this._frameIntervals.reduce((a, b) => a + b, 0) / this._frameIntervals.length 
-        : 0
-    }
-  }
-  
-  // Check if video is stuttering
-  isStuttering() {
-    return this._stutterCount > 3
-  }
-  
-  // Reset stutter counter after sync
-  resetStutterCount() {
-    this._stutterCount = 0
-    this._frameIntervals = []
-  }
-  
-  // Method to force resync - aligns video frame count with audio position
-  resync(audioPositionMs = null) {
-    const now = Date.now()
-    
-    if (audioPositionMs !== null && audioPositionMs > 0) {
-      // Calculate what frame count the video should be at to match audio position
-      const targetFrameCount = Math.floor(audioPositionMs * this._targetFPS / 1000)
-      this._framesSent = targetFrameCount
-    } else {
-      this._framesSent = 0
-    }
-    
-    // Reset timing but keep the adjusted frame count
-    this._startTime = now
-    this._pausedTime = 0
-    this._pauseStart = null
-    this._lastFrameTime = now
-    this._lastFrameSendTime = now
-    this._stutterCount = 0
-    this._frameIntervals = []
-    this._bufferFrameCount = 0
-  }
-
-  stop() {
-    this._stopped = true
-    this._paused = true
-    this._hasStartedPlayback = false
-    this._suppressNextClose = false
-    if (this._retryTimer) { clearTimeout(this._retryTimer); this._retryTimer = null }
-    this._retryCount = 0
-    if (this._ffmpeg) { try { this._ffmpeg.kill() } catch {} ; this._ffmpeg = null }
-    if (this._timer) { clearInterval(this._timer); this._timer = null }
-    this._buf = Buffer.alloc(0)
-  }
-}
-
-class StreamPlayer extends EventEmitter {
-  constructor(audioSource, url, loop = false, effect = null) {
-    super()
-    this._source     = audioSource
-    this._url        = sanitizeMediaInput(url)
-    this._loop       = loop
-    this._effect     = effect || { enabled: false, type: 'none', pitch: 0, reverb: 0, distortion: 0, echo: 0, tremolo: 0, robot: false, alien: false }
-    this._ffmpeg     = null
-    this._timer      = null
-    this._retryTimer = null
-    this._buf        = Buffer.alloc(0)
-    this._stopped    = false
-    this._paused     = true
-    this._volume     = 1.0
-    this._framesSent = 0
-    this._startTime  = null
-    this._pausedTime = 0 // Total time spent paused (for wall-clock position)
-    this._pauseStart = null // When we paused (to track paused duration)
-    this._hasStartedPlayback = false
-    this._suppressNextClose = false
-    this._retryCount = 0
-    this._lastFfmpegError = ''
-    this._debugLabel = 'Stream'
-    this._trimLogCooldownMs = 1200
-    this._lastTrimLogAt = 0
-    this._pendingTrimFrames = 0
-    this._decodedFrames = 0
-  }
-
-  start() {
-    this._stopped    = false
-    this._paused     = true
-    this._framesSent = 0
-    this._hasStartedPlayback = false
-    this._suppressNextClose = false
-    this._retryCount = 0
-    this._lastFfmpegError = ''
-    this._decodedFrames = 0
-    if (this._retryTimer) { clearTimeout(this._retryTimer); this._retryTimer = null }
-    // Spawn lazily on first unpause to avoid startup kill/restart races.
-    if (this._ffmpeg) { try { this._ffmpeg.kill() } catch {} ; this._ffmpeg = null }
-    this._buf = Buffer.alloc(0)
-  }
-
-  _spawnFfmpeg() {
-    if (this._stopped) return
-
-    if (!this._url) {
-      this.emit('error', new Error('Stream URL is empty'))
-      return
-    }
-
-    const isHttpUrl = isHttpInput(this._url)
-    const isYouTube = this._url.includes('googlevideo.com')
-    const userAgent = isYouTube 
-      ? 'Mozilla/5.0 (Linux; Android 10) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36'
-      : 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
-    
-    const args = [
-      '-loglevel', 'warning',
-      '-fflags', 'nobuffer',
-      '-flags', 'low_delay',
-      '-analyzeduration', '0',
-      '-probesize', '32k',
-    ]
-
-    if (isHttpUrl) {
-      args.push('-re', ...buildHttpInputArgs(this._url, userAgent))
-    } else {
-      args.push('-re', '-i', this._url)
-    }
-    
-    args.push(
-      '-vn',
-      '-ar', String(SAMPLE_RATE),
-      '-ac', String(CHANNELS)
-    )
-    
-    const filter = buildAudioFilter(this._effect)
-    if (filter) {
-      args.push('-af', filter)
-    }
-
-    args.push('-f', 's16le', 'pipe:1')
-    
-    this._ffmpeg = spawn('ffmpeg', args)
-
-    this._ffmpeg.stdout.on('data', (chunk) => {
-      if (chunk.length > 0) {
-        this._decodedFrames += Math.floor(chunk.length / FRAME_BYTES)
-      }
-      this._buf = Buffer.concat([this._buf, chunk])
-      const maxBytes = FRAME_BYTES * MAX_STREAM_BUFFER_FRAMES
-      if (this._buf.length > maxBytes) {
-        const droppedFrames = Math.floor((this._buf.length - maxBytes) / FRAME_BYTES)
-        this._buf = this._buf.slice(this._buf.length - maxBytes)
-        if (droppedFrames > 0) {
-          this._pendingTrimFrames += droppedFrames
-          const now = Date.now()
-          if ((now - this._lastTrimLogAt) >= this._trimLogCooldownMs && this._pendingTrimFrames > 0) {
-            this._log(`Trimmed oversized audio buffer by ${this._pendingTrimFrames} frames`)
-            this._pendingTrimFrames = 0
-            this._lastTrimLogAt = now
-          }
-        }
-      }
-    })
-
-    this._ffmpeg.stderr.on('data', (d) => {
-      const msg = d.toString().trim()
-      if (msg) {
-        this._lastFfmpegError = msg
-        console.warn('[Wire/Voice/Stream] ffmpeg:', msg)
-      }
-    })
-
-    this._ffmpeg.on('close', (code) => {
-      if (this._suppressNextClose) {
-        this._suppressNextClose = false
-        return
-      }
-      console.log(`[Wire/Voice/Stream] ffmpeg closed (code=${code})`)
-      const hadOutput = this._decodedFrames > 0 || this._buf.length >= FRAME_BYTES
-      const emptyClose = !hadOutput
-      const shouldRetry = !this._stopped && isHttpUrl && (code !== 0 || emptyClose) && this._retryCount < MAX_PLAYER_RETRY_ATTEMPTS
-      if (shouldRetry) {
-        this._retryCount++
-        this._log(`Retrying stream after close (attempt ${this._retryCount}/${MAX_PLAYER_RETRY_ATTEMPTS}, code=${code}, empty=${emptyClose})`)
-        this._retryTimer = setTimeout(() => this._spawnFfmpeg(), FFMPEG_RETRY_BACKOFF_MS * this._retryCount)
-        return
-      }
-      if (!this._stopped && (code !== 0 || emptyClose) && !hadOutput) {
-        this.emit('error', new Error(`Stream ffmpeg exited without playable audio (code=${code}): ${this._lastFfmpegError || 'unknown error'}`))
-        return
-      }
-      if (!this._stopped && this._loop) {
-        this._buf = Buffer.alloc(0)
-        this._spawnFfmpeg()
-      } else {
-        this._drainAndFinish()
-      }
-    })
-
-    this._ffmpeg.on('error', (err) => {
-      console.error('[Wire/Voice/Stream] ffmpeg error:', err.message)
-      this._lastFfmpegError = err.message
-      if (this._retryCount < MAX_PLAYER_RETRY_ATTEMPTS) {
-        this._retryCount++
-        this._log(`Retrying audio ffmpeg (attempt ${this._retryCount}/${MAX_PLAYER_RETRY_ATTEMPTS})`)
-        this._retryTimer = setTimeout(() => this._spawnFfmpeg(), FFMPEG_RETRY_BACKOFF_MS * this._retryCount)
-      } else {
-        this._retryCount = 0
-        this.emit('error', err)
-      }
-    })
-  }
-
-  _log(...args) {
-    console.log(`[Wire/Voice/${this._debugLabel}]`, ...args)
-  }
-
-  // StreamPlayer unpause - aggressive pumping for streaming
-  unpause(baseStartTime = null) {
-    if (!this._paused) return
-    const now = Number.isFinite(baseStartTime) ? baseStartTime : Date.now()
-
-    // Ensure first playback starts from the beginning of the source.
-    if (!this._hasStartedPlayback) {
-      this._hasStartedPlayback = true
-    }
-    if (!this._ffmpeg) {
-      this._buf = Buffer.alloc(0)
-      this._spawnFfmpeg()
-    }
-
-    this._paused = false
-    
-    // Track paused time for accurate wall-clock position
-    if (this._pauseStart) {
-      this._pausedTime += now - this._pauseStart
-      this._pauseStart = null
-    }
-    
-    // Initialize start time on first unpause
-    if (!this._startTime) {
-      this._startTime = now
-    }
-    
-    if (!this._timer && !this._stopped) {
-      this._timer = setInterval(() => this._pump(), FRAME_DURATION)
-    }
-  }
-
-  pause() {
-    this._paused = true
-    this._pauseStart = Date.now() // Track when we paused
-    if (this._timer) {
-      clearInterval(this._timer)
-      this._timer = null
-    }
-  }
-
-  // Get current audio position in milliseconds using wall-clock time (same as video)
-  getPosition() {
-    if (!this._startTime || this._paused) return 0
-    // Wall-clock position: time since start minus time spent paused
-    return Date.now() - this._startTime - this._pausedTime
-  }
-
-  _pump() {
-    if (this._stopped || this._paused) return
-    if (this._buf.length < FRAME_BYTES) return
-
-    // Keep latency bounded by discarding old audio when producer outruns send cadence.
-    const bufferedFrames = Math.floor(this._buf.length / FRAME_BYTES)
-    if (bufferedFrames > MAX_STREAM_TARGET_BUFFER_FRAMES) {
-      const staleFrames = bufferedFrames - MAX_STREAM_TARGET_BUFFER_FRAMES
-      this._buf = this._buf.slice(staleFrames * FRAME_BYTES)
-      this._pendingTrimFrames += staleFrames
-      const now = Date.now()
-      if ((now - this._lastTrimLogAt) >= this._trimLogCooldownMs && this._pendingTrimFrames > 0) {
-        this._log(`Dropped ${this._pendingTrimFrames} stale audio frames for low-latency catch-up`)
-        this._pendingTrimFrames = 0
-        this._lastTrimLogAt = now
-      }
-      if (this._buf.length < FRAME_BYTES) return
-    }
-
-    const elapsedFrames = this._startTime
-      ? Math.floor((Date.now() - this._startTime - this._pausedTime) / FRAME_DURATION)
-      : this._framesSent + 1
-    const framesDue = Math.max(1, Math.min(3, elapsedFrames - this._framesSent))
-
-    for (let i = 0; i < framesDue; i++) {
-      if (this._buf.length < FRAME_BYTES) break
-      const frameData = Buffer.alloc(FRAME_BYTES)
-      this._buf.copy(frameData, 0, 0, FRAME_BYTES)
-      this._buf = this._buf.slice(FRAME_BYTES)
-
-      let samples = new Int16Array(frameData.buffer, frameData.byteOffset, FRAME_SAMPLES)
-      if (this._volume !== 1.0) {
-        const floatSamples = new Float32Array(FRAME_SAMPLES)
-        for (let j = 0; j < FRAME_SAMPLES; j++) {
-          floatSamples[j] = (samples[j] / 32768) * this._volume
-        }
-        samples = new Int16Array(FRAME_SAMPLES)
-        for (let j = 0; j < FRAME_SAMPLES; j++) {
-          const val = Math.max(-1, Math.min(1, floatSamples[j]))
-          samples[j] = Math.round(val * 32767)
-        }
-      }
-
-      try {
-        this._source.onData({
-          samples,
-          sampleRate: SAMPLE_RATE,
-          bitsPerSample: BITS,
-          channelCount: CHANNELS,
-          numberOfFrames: FRAME_SAMPLES,
-        })
-        this._framesSent++
-      } catch (err) {
-        console.error('[Wire/Voice/Stream] Error sending frame:', err.message)
-        break
-      }
-    }
-  }
-
-  stop() {
-    this._stopped = true
-    this._paused = true
-    this._hasStartedPlayback = false
-    this._suppressNextClose = false
-    if (this._retryTimer) { clearTimeout(this._retryTimer); this._retryTimer = null }
-    this._retryCount = 0
-    if (this._ffmpeg) { try { this._ffmpeg.kill() } catch {} ; this._ffmpeg = null }
-    if (this._timer) { clearInterval(this._timer); this._timer = null }
-    this._buf = Buffer.alloc(0)
-  }
-
-  resetPosition() {
-    this._startTime = Date.now()
-    this._framesSent = 0
-  }
-
-  _drainAndFinish() {
-    if (this._buf.length < FRAME_BYTES) {
-      this._paused = true
-      this.emit('finish')
-      return
-    }
-    this._pump()
-    setTimeout(() => this._drainAndFinish(), FRAME_DURATION)
-  }
-
-  setVolume(vol) {
-    this._volume = vol
-  }
-}
-
-class PeerState {
-  constructor(peerId, localId, polite) {
-    this.peerId          = peerId
-    this.polite          = polite
-    this.pc              = null
-    this.makingOffer     = false
-    this.ignoreOffer     = false
-    this.pendingCandidates = []
-    this.remoteDescSet   = false
-    this.needsNegotiation = false
-    this.needsIceRestart  = false
-    this._peerJoinEmitted = false
-    this._joinResyncDone = false
-  }
-}
-
 export class VoiceConnection extends EventEmitter {
   constructor(socket, botId, serverId, channelId, options = {}) {
     super()
@@ -1100,11 +65,13 @@ export class VoiceConnection extends EventEmitter {
     this._channelId  = channelId
     this._debug      = options.debug || false
     this._iceServers = buildIceServers(options.iceServers || [])
+    this._encrypted  = options.encrypted !== false // Default to encrypted
 
     const wrtc = loadWrtc()
     this._RTCPeerConnection     = wrtc.RTCPeerConnection
     this._RTCSessionDescription = wrtc.RTCSessionDescription
     this._RTCIceCandidate       = wrtc.RTCIceCandidate
+    this._RTCRtpSender          = wrtc.RTCRtpSender || globalThis.RTCRtpSender || null
     this._MediaStream           = wrtc.MediaStream
     const { RTCAudioSource, RTCVideoSource }    = wrtc.nonstandard
 
@@ -1119,10 +86,22 @@ export class VoiceConnection extends EventEmitter {
     this._videoType   = null
     this._videoSender = null
     this._lastVideoAnnouncementKey = null
+    this._videoTransitioning = false  // Flag to prevent stop announcement during video transitions
 
     this._peers     = new Map()
     this._player    = null
     this._videoPlayer = null
+    this._dualStreamPlayer = null
+    this._dualStreamStarted = false
+    this._dualStreamStartup = null
+    const dualNoMediaTimeoutRaw = Number(process.env.WIRE_DUALSTREAM_NO_MEDIA_TIMEOUT_MS)
+    this._dualStreamNoMediaTimeoutMs = Number.isFinite(dualNoMediaTimeoutRaw)
+      ? Math.max(0, dualNoMediaTimeoutRaw)
+      : DEFAULT_DUALSTREAM_NO_MEDIA_TIMEOUT_MS
+    this._lastAudioPlayback = null
+    this._lastVideoPlayback = null
+    this._useDualStream = true
+    this._videoPlaybackRequested = false  // Track if video playback was requested
     this._heartbeat = null
     this._joined    = false
     this._syncInterval = null
@@ -1153,13 +132,17 @@ export class VoiceConnection extends EventEmitter {
       echo: 0,
       tremolo: 0,
       robot: false,
-      alien: false
+      alien: false //MAX HEADROOM INCIDENT MODE............... OOOOOO MY PILES!
     }
     this._throttledLogState = new Map()
 
     this._onParticipants  = this._onParticipants.bind(this)
     this._onUserJoined    = this._onUserJoined.bind(this)
     this._onUserLeft      = this._onUserLeft.bind(this)
+    this._onUserReconnected = this._onUserReconnected.bind(this)
+    this._onUserUpdated   = this._onUserUpdated.bind(this)
+    this._onVideoUpdate  = this._onVideoUpdate.bind(this)
+    this._onScreenShareUpdate = this._onScreenShareUpdate.bind(this)
     this._onOffer         = this._onOffer.bind(this)
     this._onAnswer        = this._onAnswer.bind(this)
     this._onIceCandidate  = this._onIceCandidate.bind(this)
@@ -1170,6 +153,287 @@ export class VoiceConnection extends EventEmitter {
   }
 
   _log(...args) { if (this._debug) console.log('[Wire/Voice]', ...args) }
+
+  _waitForStable(pc) {
+    if (pc.signalingState === 'stable') return Promise.resolve()
+    return new Promise(resolve => {
+      const onChange = () => {
+        if (pc.signalingState === 'stable') {
+          pc.removeEventListener('signalingstatechange', onChange)
+          resolve()
+        }
+      }
+      pc.addEventListener('signalingstatechange', onChange)
+    })
+  }
+
+  async _safeNegotiate(ps, iceRestart = false) {
+    if (ps._negotiating) {
+      ps._negotiateQueued = true
+      this._log(`Queued negotiation for ${ps.peerId}`)
+      return
+    }
+
+    ps._negotiating = true
+    try {
+      if (ps.pc.signalingState !== 'stable') {
+        this._log(`Waiting for stable signaling for ${ps.peerId}`)
+        await this._waitForStable(ps.pc)
+      }
+
+      await this._negotiate(ps, { iceRestart })
+    } finally {
+      ps._negotiating = false
+
+      if (ps._negotiateQueued) {
+        ps._negotiateQueued = false
+        this._log(`Running queued negotiation for ${ps.peerId}`)
+        queueMicrotask(() => this._safeNegotiate(ps, iceRestart))
+      }
+    }
+  }
+
+  _negotiationCooldown = new Map()
+
+  _canNegotiate(ps) {
+    const now = Date.now()
+    const lastNegotiation = this._negotiationCooldown.get(ps.peerId) || 0
+    if (now - lastNegotiation < 500) {
+      return false
+    }
+    this._negotiationCooldown.set(ps.peerId, now)
+    return true
+  }
+
+  _ensureTransceivers(pc) {
+    // Only add recvonly transceivers if we don't have any tracks to send yet
+    // This ensures proper negotiation with Chrome which is strict about transceiver setup
+    const transceivers = pc.getTransceivers()
+    const hasAudio = transceivers.some(t => t.sender?.track?.kind === 'audio' || t.receiver?.track?.kind === 'audio')
+    const hasVideo = transceivers.some(t => t.sender?.track?.kind === 'video' || t.receiver?.track?.kind === 'video')
+    
+    // Only add transceivers if they don't exist at all
+    // Use 'sendrecv' direction to allow bidirectional media flow (Chrome prefers this)
+    if (!hasAudio) {
+      pc.addTransceiver('audio', { direction: 'sendrecv' })
+      this._log('Added audio transceiver with sendrecv direction')
+    }
+    // Only add video transceiver if video playback was explicitly requested
+    if (!hasVideo && this._videoPlaybackRequested && this._videoTrack) {
+      pc.addTransceiver('video', { direction: 'sendrecv' })
+      this._log('Added video transceiver with sendrecv direction')
+    }
+  }
+
+  _addIceCandidate(ps, candidate) {
+    const pc = ps.pc
+    if (!pc || !candidate) return
+    
+    if (pc.remoteDescription) {
+      pc.addIceCandidate(candidate).catch(() => {})
+    } else {
+      ps._pendingIce = ps._pendingIce || []
+      ps._pendingIce.push(candidate)
+    }
+  }
+
+  _flushPendingIce(ps) {
+    const pc = ps.pc
+    if (!pc) return
+    const pending = ps._pendingIce || []
+    ps._pendingIce = []
+    for (const c of pending) {
+      try { pc.addIceCandidate(c).catch(() => {}) } catch {}
+    }
+  }
+
+  _setCodecPreferences(pc) {
+    try {
+      // Get audio transceivers
+      const audioTransceivers = pc.getTransceivers().filter(t => t.sender?.track?.kind === 'audio')
+      
+      if (audioTransceivers.length > 0) {
+        const senderApi = this._RTCRtpSender
+        const audioCaps = senderApi?.getCapabilities?.('audio')?.codecs || []
+        if (audioCaps.length > 0) {
+          // Chrome requires ALL codecs to be passed, sorted by preference
+          // Put Opus first, then all other codecs
+          const opusCodecs = audioCaps.filter(c => c.mimeType.toLowerCase() === 'audio/opus')
+          const otherCodecs = audioCaps.filter(c => c.mimeType.toLowerCase() !== 'audio/opus')
+          const sortedCodecs = [...opusCodecs, ...otherCodecs]
+          
+          audioTransceivers.forEach(t => {
+            try { 
+              t.setCodecPreferences(sortedCodecs)
+              this._log('Set audio codec preferences for transceiver, Opus first among', sortedCodecs.length, 'codecs')
+            } catch (err) {
+              this._log('Failed to set audio codec preferences:', err.message)
+            }
+          })
+        }
+      }
+      
+      // Set video codec preferences - VP8 ONLY for Chrome A/V sync
+      // VP9 and AV1 cause 300-800ms drift on Chrome
+      const videoTransceivers = pc.getTransceivers().filter(t => t.sender?.track?.kind === 'video')
+      if (videoTransceivers.length > 0) {
+        const senderApi = this._RTCRtpSender
+        const videoCaps = senderApi?.getCapabilities?.('video')?.codecs || []
+        if (videoCaps.length > 0) {
+          // ONLY use VP8 for Chrome A/V sync - VP9/AV1 cause drift
+          const vp8Codecs = videoCaps.filter(c => c.mimeType.toLowerCase() === 'video/vp8')
+          // Fallback to H264 if VP8 not available
+          const h264Codecs = videoCaps.filter(c => c.mimeType.toLowerCase() === 'video/h264')
+          
+          // Use VP8 only, or H264 as fallback - NO VP9/AV1
+          const sortedVideoCodecs = vp8Codecs.length > 0 ? vp8Codecs : h264Codecs
+          
+          videoTransceivers.forEach(t => {
+            try { 
+              if (sortedVideoCodecs.length > 0) {
+                t.setCodecPreferences(sortedVideoCodecs)
+                this._log('Set video codec preferences, VP8 only (for A/V sync) among', sortedVideoCodecs.length, 'codecs')
+              }
+            } catch (err) {
+              this._log('Failed to set video codec preferences:', err.message)
+            }
+          })
+        }
+      }
+    } catch (err) {
+      this._log('Failed to set codec preferences:', err.message)
+    }
+  }
+  
+  _enhanceOpusSdp(description) {
+    if (!description?.sdp || typeof description.sdp !== 'string') return description
+
+    let sdp = description.sdp
+    const opusPayloads = []
+    const opusRegex = /^a=rtpmap:(\d+)\s+opus\/48000(?:\/2)?$/gim
+    let match
+    while ((match = opusRegex.exec(sdp)) !== null) {
+      opusPayloads.push(match[1])
+    }
+    if (opusPayloads.length === 0) return description
+
+    const forcedParams = {
+      stereo: '1',
+      'sprop-stereo': '1',
+      channels: '2',
+      maxaveragebitrate: '192000',
+      cbr: '0',
+      useinbandfec: '1',
+      usedtx: '0'
+    }
+
+    for (const payload of opusPayloads) {
+      // Ensure RTP map explicitly advertises 2 channels.
+      const rtpmapNormalizeRegex = new RegExp(`^a=rtpmap:${payload}\\s+opus\\/48000(?:\\/2)?$`, 'mi')
+      sdp = sdp.replace(rtpmapNormalizeRegex, `a=rtpmap:${payload} opus/48000/2`)
+
+      const fmtpRegex = new RegExp(`^a=fmtp:${payload}\\s+(.+)$`, 'mi')
+      const fmtpMatch = sdp.match(fmtpRegex)
+
+      if (fmtpMatch) {
+        const parsed = {}
+        fmtpMatch[1]
+          .split(';')
+          .map(p => p.trim())
+          .filter(Boolean)
+          .forEach((pair) => {
+            const [rawKey, ...rest] = pair.split('=')
+            const key = String(rawKey || '').trim()
+            if (!key) return
+            const value = rest.length ? rest.join('=').trim() : ''
+            parsed[key.toLowerCase()] = value
+          })
+
+        for (const [k, v] of Object.entries(forcedParams)) {
+          parsed[k] = v
+        }
+
+        const rebuilt = Object.entries(parsed)
+          .map(([k, v]) => (v ? `${k}=${v}` : k))
+          .join(';')
+        sdp = sdp.replace(fmtpRegex, `a=fmtp:${payload} ${rebuilt}`)
+      } else {
+        const rtpmapLineRegex = new RegExp(`^a=rtpmap:${payload}\\s+opus\\/48000(?:\\/2)?$`, 'mi')
+        const insertion = `a=fmtp:${payload} ${Object.entries(forcedParams).map(([k, v]) => `${k}=${v}`).join(';')}`
+        sdp = sdp.replace(rtpmapLineRegex, (line) => `${line}\r\n${insertion}`)
+      }
+    }
+
+    return { ...description, sdp }
+  }
+
+  _setAudioQuality(pc, bitrate = 192000) {
+    try {
+      const senders = pc.getSenders()
+      const audioSender = senders.find(s => s.track?.kind === 'audio')
+      if (!audioSender) return
+
+      const params = audioSender.getParameters()
+      if (!params.encodings || params.encodings.length === 0) {
+        params.encodings = [{}]
+      }
+
+      const encoding = {
+        ...params.encodings[0],
+        maxBitrate: bitrate
+      }
+      if (typeof encoding.dtx === 'undefined') {
+        encoding.dtx = 'disabled'
+      }
+      params.encodings[0] = encoding
+
+      audioSender.setParameters(params).then(() => {
+        this._log(`Set audio bitrate to ${Math.round(bitrate / 1000)} kbps with DTX disabled`)
+      }).catch(err => {
+        this._log('Failed to set audio bitrate params:', err.message)
+      })
+    } catch (err) {
+      this._log('Failed to set audio quality params:', err.message)
+    }
+  }
+
+  _getAdaptiveVideoBitrate() {
+    const peerCount = Math.max(1, this._peers?.size || 1)
+    if (peerCount >= 5) return 2200000
+    if (peerCount === 4) return 2800000
+    if (peerCount === 3) return 3500000
+    if (peerCount === 2) return 4500000
+    return 5500000
+  }
+
+  // Set adaptive bitrate for video to balance quality and stability as peer count changes
+  _setVideoBitrate(pc, bitrate = null) {
+    try {
+      const senders = pc.getSenders()
+      const videoSender = senders.find(s => s.track?.kind === 'video')
+      
+      if (videoSender) {
+        const targetBitrate = Number.isFinite(bitrate) ? bitrate : this._getAdaptiveVideoBitrate()
+        const params = videoSender.getParameters()
+        if (!params.encodings) params.encodings = [{}]
+        
+        params.encodings[0] = {
+          ...params.encodings[0],
+          maxBitrate: targetBitrate,
+          maxFramerate: 24,
+          scaleResolutionDownBy: 1    // Don't downscale
+        }
+        
+        videoSender.setParameters(params).then(() => {
+          this._log(`Set video bitrate to ${(targetBitrate / 1000000).toFixed(2)} Mbps (peers=${this._peers?.size || 0})`)
+        }).catch(err => {
+          this._log('Failed to set video bitrate:', err.message)
+        })
+      }
+    } catch (err) {
+      this._log('Failed to set video bitrate:', err.message)
+    }
+  }
 
   _logThrottled(key, cooldownMs, ...args) {
     const now = Date.now()
@@ -1213,11 +477,24 @@ export class VoiceConnection extends EventEmitter {
       return false
     }
 
+    // Emit video state to all clients in channel
     this._socket.emit(eventName, {
       channelId: this._channelId,
       userId: this._botId,
       enabled,
     })
+    
+    // Also emit video-update/screen-share-update events for proper client handling
+    // Use 'type' field (not 'videoType') to match client expectations
+    const updateEventName = videoType === 'screen' ? 'voice:screen-share-update' : 'voice:video-update'
+    this._socket.emit(updateEventName, {
+      channelId: this._channelId,
+      userId: this._botId,
+      enabled,
+      type: videoType,  // Changed from 'videoType' to 'type' to match client expectations
+      videoType: videoType,  // Keep both for backwards compatibility
+    })
+    
     this._lastVideoAnnouncementKey = key
     this._log(`Announced ${eventName} enabled=${enabled} (${reason})`)
     return true
@@ -1226,6 +503,10 @@ export class VoiceConnection extends EventEmitter {
   _restoreVideoSignalingState(reason = 'restore') {
     if (!this._joined || !this._socket?.connected) return
     if (!this._videoTrack || !this._videoType) return
+    if (!this._videoPlaybackRequested) {
+      this._log(`Skipping video signaling restore - video not requested (${reason})`)
+      return
+    }
     this._announceVideoState({
       enabled: true,
       videoType: this._videoType,
@@ -1237,7 +518,7 @@ export class VoiceConnection extends EventEmitter {
 
   _onSocketConnect() {
     if (!this._joined) return
-    this._log('Socket connected — rejoining channel and restoring media signaling')
+    this._log('Socket connected — rejoining channel and restoring media signaling (hopefully........ hopefully))')
     const peerIdsToReconnect = [...this._peers.keys()]
     if (peerIdsToReconnect.length > 0) {
       this._log(`Resetting ${peerIdsToReconnect.length} peer connections after socket reconnect`)
@@ -1314,12 +595,18 @@ export class VoiceConnection extends EventEmitter {
     })
   }
 
-  playFile(filePath, { loop = false, effect = null } = {}) {
+  playFile(filePath, { loop = false, effect = null, seekMs = 0 } = {}) {
     this.stopAudio()
     const resolved = path.resolve(filePath)
+    const normalizedSeekMs = Math.max(0, Number(seekMs) || 0)
+    this._lastAudioPlayback = {
+      type: 'file',
+      source: resolved,
+      options: { loop, effect },
+    }
     
     const playerEffect = effect || this._voiceEffect
-    this._player = new AudioPlayer(this._audioSource, resolved, loop, playerEffect)
+    this._player = new AudioPlayer(this._audioSource, resolved, loop, playerEffect, normalizedSeekMs)
     this._player.on('finish', () => { this._log('Audio finished:', resolved); this.emit('finish') })
     this._player.on('error',  (err) => { this._log('Audio error:', err.message); this.emit('error', err) })
     this._player.start()
@@ -1349,7 +636,7 @@ export class VoiceConnection extends EventEmitter {
     return Promise.resolve()
   }
 
-  playUrl(url, { loop = false, effect = null } = {}) {
+  playUrl(url, { loop = false, effect = null, seekMs = 0 } = {}) {
     this.stopAudio()
     const normalizedUrl = sanitizeMediaInput(url)
     if (!normalizedUrl || !isHttpInput(normalizedUrl)) {
@@ -1359,10 +646,18 @@ export class VoiceConnection extends EventEmitter {
       return Promise.reject(err)
     }
     
+    const normalizedSeekMs = Math.max(0, Number(seekMs) || 0)
+    this._lastAudioPlayback = {
+      type: 'url',
+      source: normalizedUrl,
+      options: { loop, effect },
+    }
+    
     const playerEffect = effect || this._voiceEffect
-    this._player = new StreamPlayer(this._audioSource, normalizedUrl, loop, playerEffect)
+    this._player = new StreamPlayer(this._audioSource, normalizedUrl, loop, playerEffect, normalizedSeekMs)
     this._player.on('finish', () => { this._log('Stream finished:', normalizedUrl); this.emit('finish') })
     this._player.on('error',  (err) => { this._log('Stream error:', err.message); this.emit('error', err) })
+    this._player.on('urlExpired',  (err) => { this._log('Stream URL expired:', err.message); this.emit('audioUrlExpired', err) })
     this._player.start()
 
     if (this._hasConnectedPeer()) {
@@ -1390,17 +685,232 @@ export class VoiceConnection extends EventEmitter {
     return Promise.resolve()
   }
 
-  playVideo(filePath, { loop = false, type = 'screen', audioUrl = null } = {}) {
-    this.stopVideo()
+  _buildVideoProfile(targetHeight = null, targetFps = null) {
+    const safeHeight = Math.max(360, Number(targetHeight) || 900)
+    const safeFps = Math.max(15, Math.min(30, Number(targetFps) || 24))
+    let width = Math.round((safeHeight * 16) / 9)
+    if (width % 2 !== 0) width += 1
+    const height = safeHeight % 2 === 0 ? safeHeight : safeHeight + 1
+    return { width, height, fps: safeFps }
+  }
+
+  _clearDualStreamStartup() {
+    const startup = this._dualStreamStartup
+    if (!startup) return
+
+    if (startup.pollTimer) {
+      clearTimeout(startup.pollTimer)
+      startup.pollTimer = null
+    }
+
+    if (startup.peerJoinFallbackTimer) {
+      clearTimeout(startup.peerJoinFallbackTimer)
+      startup.peerJoinFallbackTimer = null
+    }
+
+    if (startup.onPeerJoin) {
+      this.off('peerJoin', startup.onPeerJoin)
+      startup.onPeerJoin = null
+    }
+
+    this._dualStreamStartup = null
+  }
+
+  _logDualStreamStartupState(startup, state, detail = '') {
+    if (!startup) return
+    if (startup.lastLoggedState === state && startup.lastLoggedDetail === detail) return
+    startup.lastLoggedState = state
+    startup.lastLoggedDetail = detail
+    const suffix = detail ? ` (${detail})` : ''
+    console.log(`[Wire/Voice/Startup] DualStream state=${state}${suffix}`)
+  }
+
+  _startDualStreamStartupController() {
+    this._clearDualStreamStartup()
+
+    if (!this._dualStreamPlayer) return
+
+    const startup = {
+      player: this._dualStreamPlayer,
+      startRequested: false,
+      startRequestedAt: 0,
+      mediaDeadlineAt: 0,
+      pollTimer: null,
+      peerJoinFallbackTimer: null,
+      onPeerJoin: null,
+      fallbackTriggered: false,
+      fallbackReason: null,
+      lastLoggedState: null,
+      lastLoggedDetail: null,
+    }
+    this._dualStreamStartup = startup
+
+    if (this._hasConnectedPeer()) {
+      this._logDualStreamStartupState(startup, 'waiting-start', 'connected-peer')
+      this._log('Peers already connected — preparing deterministic DualStream start')
+      this._requestDualStreamStart('connected-peer')
+      return
+    }
+
+    this._logDualStreamStartupState(startup, 'waiting-peer', 'no connected peers yet')
+    startup.onPeerJoin = () => {
+      this._logDualStreamStartupState(startup, 'waiting-start', 'peer-join')
+      this._log('Peer joined — preparing deterministic DualStream start')
+      this._requestDualStreamStart('peer-join')
+    }
+    this.once('peerJoin', startup.onPeerJoin)
+
+    startup.peerJoinFallbackTimer = setTimeout(() => {
+      this._logDualStreamStartupState(startup, 'waiting-start', 'peer-join-timeout')
+      this._log('Fallback: no peer join event — preparing deterministic DualStream start')
+      this._requestDualStreamStart('peer-join-timeout')
+    }, 2000)
+  }
+
+  _requestDualStreamStart(trigger = 'unknown') {
+    const startup = this._dualStreamStartup
+    if (!startup) return
+    if (!this._dualStreamPlayer || this._dualStreamPlayer !== startup.player) return
+    if (this._dualStreamStarted || startup.startRequested) return
+
+    startup.startRequested = true
+    startup.startRequestedAt = Date.now()
+    this._logDualStreamStartupState(startup, 'start-requested', trigger)
+    this._log(`DualStream start requested (${trigger})`)
+
+    const startNow = (reason) => {
+      if (!this._dualStreamPlayer || this._dualStreamPlayer !== startup.player) return
+      if (this._dualStreamStarted) return
+      this._dualStreamPlayer.unpause(Date.now())
+      this._dualStreamStarted = true
+      this._logDualStreamStartupState(startup, 'started', reason)
+      this._log(`DualStream started (${reason})`)
+      if (this._dualStreamNoMediaTimeoutMs <= 0) {
+        this._logDualStreamStartupState(startup, 'startup-monitor-disabled', 'timeout<=0')
+        this._log('DualStream no-media failover disabled (timeout <= 0)')
+        this._clearDualStreamStartup()
+        return
+      }
+      startup.mediaDeadlineAt = Date.now() + this._dualStreamNoMediaTimeoutMs
+      startup.pollTimer = setTimeout(poll, 40)
+    }
+
+    const switchToSplitPipeline = (reason) => {
+      if (startup.fallbackTriggered) return
+      startup.fallbackTriggered = true
+      startup.fallbackReason = reason
+      this._logDualStreamStartupState(startup, 'fallback-split-av', reason)
+      console.log(`[Wire/Voice/Startup] DualStream fallback reason=${reason}`)
+      this._clearDualStreamStartup()
+
+      if (!this._dualStreamPlayer || this._dualStreamPlayer !== startup.player) return
+      if (!this._lastVideoPlayback?.filePath) return
+
+      const req = this._lastVideoPlayback
+      const options = req.options || {}
+      const resumeAtMs = Math.max(
+        Number(this._dualStreamPlayer.getAudioPosition?.()) || 0,
+        Number(this._dualStreamPlayer.getVideoPosition?.()) || 0,
+      )
+
+      this._log(`DualStream failover to split A/V (${reason}, seek=${resumeAtMs}ms)`)
+      // Fully clear playback-request state before restarting in split mode,
+      // otherwise playVideo() can recurse in "already playing" wait loops.
+      this.stopVideo({ preservePlaybackRequest: false })
+      this.playVideo(req.filePath, {
+        ...options,
+        useDualStream: false,
+        seekMs: resumeAtMs,
+      }).catch(err => {
+        this._log('Split A/V fallback failed:', err?.message || err)
+        this.emit('videoError', err)
+      })
+    }
+
+    const softTimeoutMs = 2000
+    const hardTimeoutMs = 5500
+    const poll = () => {
+      if (!this._dualStreamPlayer || this._dualStreamPlayer !== startup.player) {
+        this._clearDualStreamStartup()
+        return
+      }
+      if (this._dualStreamStarted) {
+        const videoSent = Number(startup.player.getVideoBufferStatus?.().framesSent) || 0
+        const audioSent = Number(startup.player.getAudioBufferStatus?.().framesSent) || 0
+        if (videoSent > 0 || audioSent > 0) {
+          this._logDualStreamStartupState(startup, 'media-flow-confirmed', `videoSent=${videoSent},audioSent=${audioSent}`)
+          this._log(`DualStream media flow confirmed (videoSent=${videoSent}, audioSent=${audioSent})`)
+          this._clearDualStreamStartup()
+          return
+        }
+
+        if (startup.mediaDeadlineAt > 0 && Date.now() >= startup.mediaDeadlineAt) {
+          switchToSplitPipeline(`no media emitted within ${this._dualStreamNoMediaTimeoutMs}ms after start`)
+          return
+        }
+
+        startup.pollTimer = setTimeout(poll, 40)
+        return
+      }
+
+      const elapsedMs = Date.now() - startup.startRequestedAt
+      const videoStatus = startup.player.getVideoBufferStatus?.() || {}
+      const audioStatus = startup.player.getAudioBufferStatus?.() || {}
+      const videoFrames = Number(videoStatus.bufferedFrames) || 0
+      const audioFrames = Number(audioStatus.bufferedFrames) || 0
+      const videoInitialized = !!videoStatus.initialized
+
+      if (videoInitialized && videoFrames > 0 && audioFrames > 0) {
+        startNow(`decoder-ready after ${elapsedMs}ms`)
+        return
+      }
+
+      if (elapsedMs > softTimeoutMs && (videoFrames > 0 || audioFrames > 0 || videoInitialized)) {
+        startNow(`soft-timeout after ${elapsedMs}ms (videoFrames=${videoFrames}, audioFrames=${audioFrames}, initialized=${videoInitialized})`)
+        return
+      }
+
+      if (elapsedMs > hardTimeoutMs) {
+        switchToSplitPipeline(`no decoder init after ${elapsedMs}ms`)
+        return
+      }
+
+      startup.pollTimer = setTimeout(poll, 25)
+    }
+
+    poll()
+  }
+
+  playVideo(filePath, { loop = false, type = 'screen', audioUrl = null, useDualStream = false, seekMs = 0, targetHeight = null, targetFps = null } = {}) {
+    console.log(`[Wire/Voice] playVideo called with type=${type}, useDualStream=${useDualStream}, targetHeight=${targetHeight ?? 'auto'}, targetFps=${targetFps ?? 'auto'}`)
+    
+    if (this._videoPlaybackRequested) {
+      this._log(`Video already playing, waiting 1s for cleanup before starting new video`)
+      return new Promise((resolve, reject) => {
+        setTimeout(() => {
+          this.playVideo(filePath, { loop, type, audioUrl, useDualStream, seekMs, targetHeight, targetFps })
+            .then(resolve)
+            .catch(reject)
+        }, 1000)
+      })
+    }
+    
+    this._videoTransitioning = true
+    this._videoPlaybackRequested = true
+    console.log(`[Wire/Voice] Video playback requested - setting _videoPlaybackRequested = true`)
+    
+    this.stopVideo({ preservePlaybackRequest: true })
     this.stopAudio()
     
     const { RTCVideoSource } = loadWrtc().nonstandard
     this._videoSource = new RTCVideoSource({ isScreencast: type === 'screen' })
     this._videoTrack  = this._videoSource.createTrack()
     this._videoTrack.enabled = true
+    try { this._videoTrack.contentHint = 'detail' } catch {}
     this._videoTrack._senderTag = type
     this._videoStream = new this._MediaStream([this._videoTrack])
     this._videoType   = type
+    console.log(`[Wire/Voice] Video track created: ${!!this._videoTrack}, Video stream created: ${!!this._videoStream}, Type: ${type}`)
 
     const normalizedInput = sanitizeMediaInput(filePath)
     if (!normalizedInput) {
@@ -1412,80 +922,225 @@ export class VoiceConnection extends EventEmitter {
 
     const isUrl = isHttpInput(normalizedInput)
     const source = isUrl ? normalizedInput : path.resolve(normalizedInput)
+    const normalizedSeekMs = Math.max(0, Number(seekMs) || 0)
     
-    this._videoPlayer = new VideoPlayer(this._videoSource, source, loop)
+    const normalizedAudioInput = sanitizeMediaInput(audioUrl)
+    const audioInput = normalizedAudioInput || source
+    const audioSourcePath = isHttpInput(audioInput) ? audioInput : path.resolve(audioInput)
+
+    this._lastVideoPlayback = {
+      filePath: normalizedInput,
+      options: { loop, type, audioUrl: normalizedAudioInput || null, useDualStream, targetHeight, targetFps }
+    }
+    const videoProfile = this._buildVideoProfile(targetHeight, targetFps)
+    
+    if (useDualStream && this._useDualStream) {
+      this._log(`Using DualStreamPlayer for synced A/V (single ffmpeg) @ ${videoProfile.width}x${videoProfile.height} ${videoProfile.fps}fps`)
+      
+      this._dualStreamPlayer = new DualStreamPlayer(
+        this._videoSource, 
+        this._audioSource, 
+        source, 
+        audioSourcePath, 
+        loop, 
+        this._voiceEffect,
+        normalizedSeekMs,
+        videoProfile
+      )
+      
+      this._dualStreamPlayer.on('finish', () => { 
+        this._log('DualStream finished:', source)
+        this.emit('videoFinish')
+        this.stopVideo()
+      })
+      this._dualStreamPlayer.on('error', (err) => { 
+        this._log('DualStream error:', err.message); 
+        this.emit('videoError', err) 
+      })
+      this._dualStreamPlayer.on('urlExpired', (err) => { 
+        this._log('DualStream URL expired:', err.message); 
+        this.emit('videoUrlExpired', err) 
+      })
+      
+      this._dualStreamPlayer.start()
+      this._dualStreamPlayer.prime()
+      this._dualStreamStarted = false
+      this._log(`Playing with DualStream: ${source} (type: ${type})`)
+      
+      this._announceVideoState({ enabled: true, videoType: type, reason: 'playVideo-start' })
+      this._addVideoTrackToPeers()
+      this._startDualStreamStartupController()
+      
+      return Promise.resolve()
+    }
+    
+    this._videoPlayer = new VideoPlayer(this._videoSource, source, loop, normalizedSeekMs, videoProfile)
     this._videoPlayer.on('finish', () => { 
       this._log('Video finished:', source)
       this.emit('videoFinish')
       this.stopVideo()
     })
-    this._videoPlayer.on('error',  (err) => { this._log('Video error:', err.message); this.emit('videoError', err) })
+    this._videoPlayer.on('error',  (err) => { 
+      this._log('Video error:', err.message)
+      this.emit('videoError', err) 
+    })
+    this._videoPlayer.on('urlExpired',  (err) => { 
+      this._log('Video URL expired:', err.message)
+      this.emit('videoUrlExpired', err) 
+    })
     this._videoPlayer.start()
     this._videoPlayer.prime()
     this._log(`Playing video: ${source} (type: ${type})`)
-
-    // Use a single media source path for video mode by default.
-    // This keeps A/V naturally aligned without cross-source sync heuristics.
-    const sameSourceAudio = source
-    if (isHttpInput(sameSourceAudio)) {
-      this._player = new StreamPlayer(this._audioSource, sameSourceAudio, loop, this._voiceEffect)
+    
+    if (isHttpInput(audioSourcePath)) {
+      this._player = new StreamPlayer(this._audioSource, audioSourcePath, loop, this._voiceEffect, normalizedSeekMs)
     } else {
-      this._player = new AudioPlayer(this._audioSource, sameSourceAudio, loop, this._voiceEffect)
+      this._player = new AudioPlayer(this._audioSource, audioSourcePath, loop, this._voiceEffect, normalizedSeekMs)
     }
-    this._player.on('finish', () => { this._log('Video audio finished:', source) })
+    this._player.on('finish', () => { this._log('Video audio finished:', audioSourcePath) })
     this._player.on('error',  (err) => { this._log('Video audio error:', err.message); this.emit('error', err) })
+    this._player.on('urlExpired',  (err) => { this._log('Video audio URL expired:', err.message); this.emit('videoUrlExpired', err) })
     this._player.start()
 
-    // Ensure both players start paused; both are unpaused together when peers are ready.
     this._player.pause()
     this._videoPlayer.pause()
-    this._log(`Playing video audio: ${sameSourceAudio} (both paused for coordinated start)`)
+    this._log(`Playing video audio: ${audioSourcePath} (both paused for coordinated start)`)
 
     this._announceVideoState({ enabled: true, videoType: type, reason: 'playVideo-start' })
 
     this._addVideoTrackToPeers()
 
+    let playbackStartRequested = false
     const startPlayback = () => {
+      if (playbackStartRequested) return
+      playbackStartRequested = true
       if (!this._player || !this._videoPlayer) return
-      const waitStart = Date.now()
-      const waitForVideoFrame = () => {
-        if (!this._player || !this._videoPlayer) return
-        const status = this._videoPlayer.getBufferStatus()
-        // Wait for at least one buffered frame to avoid black-start while audio runs.
-        if (status.bufferedFrames >= 1 || Date.now() - waitStart > 2500) {
-          const barrierTime = Date.now()
-          this._videoPlayer.unpause(barrierTime)
-          this._player.unpause(barrierTime)
-          return
+
+      const AUDIO_FRAME_BYTES = 480 * 2 * 2
+      const audioBytes = this._player._buf?.length ?? 0
+      const audioMs = (audioBytes / AUDIO_FRAME_BYTES) * 10
+
+      const videoStatus = this._videoPlayer.getBufferStatus()
+      const videoFrames = videoStatus?.bufferedFrames ?? 0
+      const fps = this._videoPlayer._targetFPS || 30
+      const videoMs = (videoFrames / fps) * 1000
+
+      this._log(`Pre-start buffers — audio: ${audioMs.toFixed(0)}ms, video: ${videoMs.toFixed(0)}ms`)
+
+      if (audioMs > videoMs + 20 && this._player._buf) {
+        const targetAudioFrames = Math.max(1, Math.round(videoMs / 10))
+        const keepBytes = targetAudioFrames * AUDIO_FRAME_BYTES
+        const dropBytes = audioBytes - keepBytes
+        if (dropBytes > 0) {
+          this._player._buf = this._player._buf.slice(dropBytes)
+          this._log(`Trimmed ${(dropBytes / AUDIO_FRAME_BYTES).toFixed(0)} audio frames to match video`)
         }
-        setTimeout(waitForVideoFrame, 30)
+      } else if (videoMs > audioMs + 20) {
+        const targetVideoFrames = Math.max(1, Math.round((audioMs / 1000) * fps))
+        const frameSize = this._videoPlayer._width * this._videoPlayer._height * 3 / 2
+        const dropFrames = videoFrames - targetVideoFrames
+        if (dropFrames > 0 && this._videoPlayer._buf) {
+          this._videoPlayer._buf = this._videoPlayer._buf.slice(dropFrames * frameSize)
+          this._videoPlayer._bufferFrameCount = targetVideoFrames
+          this._log(`Trimmed ${dropFrames} video frames to match audio`)
+        }
       }
-      waitForVideoFrame()
+
+      const barrierTime = Date.now()
+      this._videoPlayer.unpause(barrierTime)
+      if (this._player && !this._player._stopped) {
+        this._player.unpause(barrierTime)
+      }
+      this._log(`Started A/V on shared barrier`)
+    }
+
+    const startAt = Date.now()
+    const waitForBothAndStart = () => {
+      if (!this._videoPlayer || !this._player) return
+
+      const videoStatus = this._videoPlayer.getBufferStatus()
+      const videoFrames = videoStatus?.bufferedFrames ?? 0
+      const videoInitialized = videoStatus?.initialized ?? false
+      const audioBytes = this._player._buf?.length ?? 0
+
+      if (videoFrames > 0 && audioBytes > 0 && videoInitialized) {
+        this._log(`Both have frames and video initialized — balancing and starting`)
+        startPlayback()
+      } else if (Date.now() - startAt > 2000 && (audioBytes > 0 || videoFrames > 0 || videoInitialized)) {
+        this._log(`Timeout fallback — starting with available buffers (audio=${audioBytes}, videoFrames=${videoFrames})`)
+        startPlayback()
+      } else if (Date.now() - startAt > 4000) {
+        this._log(`Hard timeout fallback — unpausing pipeline to prevent freeze`)
+        startPlayback()
+      } else {
+        setTimeout(waitForBothAndStart, 20)
+      }
     }
 
     if (this._hasConnectedPeer()) {
-      this._log('Peers already connected — starting coordinated A/V playback')
-      startPlayback()
+      this._log('Peers already connected — waiting for both audio and video frames')
+      waitForBothAndStart()
     } else {
       const onPeerJoin = () => {
-        this._log('Peer joined — starting coordinated A/V playback')
-        startPlayback()
+        this._log('Peer joined — waiting for both audio and video frames')
+        waitForBothAndStart()
       }
       this.once('peerJoin', onPeerJoin)
       setTimeout(() => {
         this.off('peerJoin', onPeerJoin)
         if (this._player && this._videoPlayer && this._player._paused && this._videoPlayer._paused) {
-          this._log('Fallback: starting coordinated A/V playback')
-          startPlayback()
+          this._log('Fallback: waiting for both audio and video frames')
+          waitForBothAndStart()
         }
-      }, 3000)
+      }, 2000)
     }
 
     return Promise.resolve()
   }
 
+  _hasVideoSender(pc) {
+    if (!pc) return false
+    return pc.getSenders().some(s => s.track?.kind === 'video')
+  }
+
+  _verifyNoVideoTracksSent() {
+    if (this._videoPlaybackRequested) {
+      console.log(`[Wire/Voice] Video is requested, skipping verification`)
+      return true
+    }
+    
+    let hasVideo = false
+    for (const [peerId, ps] of this._peers.entries()) {
+      if (!ps.pc) continue
+      
+      const videoSenders = ps.pc.getSenders().filter(s => s.track?.kind === 'video')
+      if (videoSenders.length > 0) {
+        console.log(`[Wire/Voice] WARNING: Found ${videoSenders.length} video sender(s) for peer ${peerId} when video is not requested`)
+        hasVideo = true
+      }
+      
+      const videoTransceivers = ps.pc.getTransceivers().filter(t => 
+        t.sender?.track?.kind === 'video' && t.direction !== 'recvonly'
+      )
+      if (videoTransceivers.length > 0) {
+        console.log(`[Wire/Voice] WARNING: Found ${videoTransceivers.length} video transceiver(s) with send capability for peer ${peerId} when video is not requested`)
+        hasVideo = true
+      }
+    }
+    
+    if (!hasVideo) {
+      console.log(`[Wire/Voice] Verified: No video tracks being sent (video not requested)`)
+    }
+    
+    return !hasVideo
+  }
+
   _addVideoTrackToPeers() {
-    if (!this._videoTrack || !this._videoStream) return
+    console.log(`[Wire/Voice] _addVideoTrackToPeers called - _videoPlaybackRequested: ${this._videoPlaybackRequested}, _videoTrack: ${!!this._videoTrack}, _videoStream: ${!!this._videoStream}, peers: ${this._peers.size}`)
+    if (!this._videoTrack || !this._videoStream) {
+      console.log(`[Wire/Voice] Skipping _addVideoTrackToPeers - missing track or stream`)
+      return
+    }
     
     for (const ps of this._peers.values()) {
       this._addVideoTrackToPeer(ps)
@@ -1493,54 +1148,159 @@ export class VoiceConnection extends EventEmitter {
   }
 
   _addVideoTrackToPeer(ps) {
+    console.log(`[Wire/Voice] _addVideoTrackToPeer called for ${ps.peerId}`)
+    console.log(`[Wire/Voice] Video track exists: ${!!this._videoTrack}, Video stream exists: ${!!this._videoStream}, PC exists: ${!!ps.pc}, Video requested: ${this._videoPlaybackRequested}`)
+    
     if (!this._videoTrack || !this._videoStream || !ps.pc) {
-      this._log(`Cannot add video track to peer ${ps.peerId} - missing track, stream, or pc`)
+      console.log(`[Wire/Voice] Cannot add video track to peer ${ps.peerId} - missing track=${!this._videoTrack}, stream=${!this._videoStream}, pc=${!ps.pc}`)
+      return false
+    }
+    
+    if (!this._videoPlaybackRequested) {
+      console.log(`[Wire/Voice] Skipping video track addition to peer ${ps.peerId} - video not requested`)
+      return false
+    }
+    
+    // Debounce: prevent multiple simultaneous video track additions
+    if (ps._addingVideoTrack) {
+      console.log(`[Wire/Voice] Video track addition already in progress for ${ps.peerId}`)
       return false
     }
     
     // Check if connection is in a usable state
     const connState = ps.pc.connectionState
+    const signalingState = ps.pc.signalingState
+    const videoTrackId = this._videoTrack?.id || 'no-track'
+    const preflightStateKey = `${videoTrackId}:${connState}:${signalingState}:${this._videoPlaybackRequested}`
+    const now = Date.now()
+
+    // Reconnect storms can trigger the same add attempt repeatedly while not ready.
+    // Suppress duplicate preflight attempts until the state changes.
+    if (connState !== 'connected' || signalingState !== 'stable') {
+      if (
+        ps._lastVideoAddPreflightKey === preflightStateKey &&
+        now - (ps._lastVideoAddPreflightAt || 0) < 800
+      ) {
+        this._logThrottled(
+          `video-add-preflight-skip:${ps.peerId}`,
+          1000,
+          `Skipping duplicate video add preflight for ${ps.peerId} (${connState}/${signalingState})`
+        )
+        return false
+      }
+      ps._lastVideoAddPreflightKey = preflightStateKey
+      ps._lastVideoAddPreflightAt = now
+    } else {
+      ps._lastVideoAddPreflightKey = null
+      ps._lastVideoAddPreflightAt = 0
+    }
+
+    console.log(`[Wire/Voice] Peer ${ps.peerId} connection state: ${connState}`)
     if (connState !== 'connected') {
-      this._log(`Peer ${ps.peerId} not connected (${connState}), will add video when connected`)
+      console.log(`[Wire/Voice] Peer ${ps.peerId} not connected (${connState}), will add video when connected`)
+      return false
+    }
+    
+    // Wait for stable signaling before modifying tracks
+    if (signalingState !== 'stable') {
+      console.log(`[Wire/Voice] Signaling not stable (${signalingState}) for ${ps.peerId}, queuing video track add`)
+      ps.needsNegotiation = true
       return false
     }
     
     // Check if we already have this track added
     const existingSender = ps.pc.getSenders().find(s => s.track === this._videoTrack)
     if (existingSender) {
-      this._log(`Video track already added to peer ${ps.peerId}`)
+      console.log(`[Wire/Voice] Video track already added to peer ${ps.peerId}`)
       return true
     }
     
-    // Check for existing video sender we can replace
-    const videoSender = ps.pc.getSenders().find(s => s.track?.kind === 'video')
-    if (videoSender) {
+    ps._addingVideoTrack = true
+    
+    // Find existing video transceiver - this is the proper way to handle video track addition
+    // We need to find a video transceiver and either replace its track or change its direction
+    const transceivers = ps.pc.getTransceivers()
+    const videoTransceiver = transceivers.find(t => t.receiver?.track?.kind === 'video' || t.sender?.track?.kind === 'video')
+    
+    console.log(`[Wire/Voice] Found ${transceivers.length} transceivers, video transceiver: ${!!videoTransceiver}`)
+    
+    if (videoTransceiver) {
+      // Check if the transceiver already has our track
+      if (videoTransceiver.sender?.track === this._videoTrack) {
+        console.log(`[Wire/Voice] Video transceiver already has our track for ${ps.peerId}`)
+        ps._addingVideoTrack = false
+        return true
+      }
+      
+      // If transceiver has no track or a different track, replace it
+      if (videoTransceiver.sender) {
+        try {
+          // First, change direction to sendrecv if it's recvonly
+          if (videoTransceiver.direction === 'recvonly') {
+            console.log(`[Wire/Voice] Changing video transceiver direction from recvonly to sendrecv for ${ps.peerId}`)
+            videoTransceiver.direction = 'sendrecv'
+          }
+          
+          // Replace the track
+          console.log(`[Wire/Voice] Replacing video track on existing transceiver for ${ps.peerId}`)
+          videoTransceiver.sender.replaceTrack(this._videoTrack)
+          
+          // Set codec preferences on this transceiver
+          try {
+            const senderApi = this._RTCRtpSender
+            const videoCaps = senderApi?.getCapabilities?.('video')?.codecs || []
+            if (videoCaps.length > 0) {
+              const vp8Codecs = videoCaps.filter(c => c.mimeType.toLowerCase() === 'video/vp8')
+              const vp9Codecs = videoCaps.filter(c => c.mimeType.toLowerCase() === 'video/vp9')
+              const h264Codecs = videoCaps.filter(c => c.mimeType.toLowerCase() === 'video/h264')
+              const otherVideoCodecs = videoCaps.filter(c => 
+                !['video/vp8', 'video/vp9', 'video/h264'].includes(c.mimeType.toLowerCase())
+              )
+              const sortedVideoCodecs = [...vp8Codecs, ...vp9Codecs, ...h264Codecs, ...otherVideoCodecs]
+              videoTransceiver.setCodecPreferences(sortedVideoCodecs)
+            }
+          } catch (codecErr) {
+            console.log(`[Wire/Voice] Failed to set codec preferences: ${codecErr.message}`)
+          }
+          
+          console.log(`[Wire/Voice] Video track replaced on transceiver for ${ps.peerId} - triggering renegotiation`)
+          this._setVideoBitrate(ps.pc)
+          this._safeNegotiate(ps).then(() => {
+            ps._addingVideoTrack = false
+          }).catch(err => {
+            console.log(`[Wire/Voice] Failed to renegotiate video track for ${ps.peerId}:`, err.message)
+            ps._addingVideoTrack = false
+          })
+          return true
+        } catch (err) {
+          console.log(`[Wire/Voice] Error replacing video track on transceiver for ${ps.peerId}:`, err.message)
+          ps._addingVideoTrack = false
+        }
+      }
+    }
+    
+    // No existing video transceiver - use addTrack to add video and create a new transceiver
+    if (!videoTransceiver) {
+      console.log(`[Wire/Voice] No video transceiver found, adding video track to create one for ${ps.peerId}`)
       try {
-        videoSender.replaceTrack(this._videoTrack)
-        this._log(`Replaced video track for peer ${ps.peerId}`)
-        this._negotiate(ps).catch(err => {
-          this._log(`Failed to renegotiate replaced video track for ${ps.peerId}:`, err.message)
+        const sender = ps.pc.addTrack(this._videoTrack, this._videoStream)
+        console.log(`[Wire/Voice] Added video track to peer ${ps.peerId}, sender: ${!!sender}`)
+        this._setVideoBitrate(ps.pc)
+        this._safeNegotiate(ps).then(() => {
+          ps._addingVideoTrack = false
+        }).catch(err => {
+          console.log(`[Wire/Voice] Failed to renegotiate after addTrack for ${ps.peerId}:`, err.message)
+          ps._addingVideoTrack = false
         })
         return true
       } catch (err) {
-        this._log(`Error replacing video track for ${ps.peerId}:`, err.message)
+        console.log(`[Wire/Voice] Error adding video track for ${ps.peerId}:`, err.message)
+        ps._addingVideoTrack = false
       }
     }
     
-    // Add new video track
-    try {
-      const sender = ps.pc.addTrack(this._videoTrack, this._videoStream)
-      if (sender) {
-        this._log(`Added video track to peer ${ps.peerId} - triggering renegotiation`)
-        this._negotiate(ps).catch(err => {
-          this._log(`Failed to renegotiate added video track for ${ps.peerId}:`, err.message)
-        })
-        return true
-      }
-    } catch (err) {
-      this._log(`Error adding video track to ${ps.peerId}:`, err.message)
-    }
-    
+    console.log(`[Wire/Voice] No suitable transceiver or sender found for video track for ${ps.peerId}`)
+    ps._addingVideoTrack = false
     return false
   }
 
@@ -1548,19 +1308,39 @@ export class VoiceConnection extends EventEmitter {
     if (!ps?.pc) return false
     const pc = ps.pc
     const videoSender = pc.getSenders().find(s => s.track?.kind === 'video')
-    if (!videoSender) return false
+    if (!videoSender) {
+      console.log(`[Wire/Voice] No video sender found for peer ${ps.peerId}`)
+      return false
+    }
 
-    try { videoSender.replaceTrack(null) } catch {}
-    try { pc.removeTrack(videoSender) } catch {}
+    console.log(`[Wire/Voice] Removing video track from peer ${ps.peerId}`)
+    try { 
+      videoSender.replaceTrack(null) 
+    } catch {}
+
+    // Set video transceiver direction back to recvonly to prevent black screen
+    const videoTransceiver = pc.getTransceivers().find(t => 
+      t.sender?.track?.kind === 'video' || t.receiver?.track?.kind === 'video'
+    )
+    if (videoTransceiver && videoTransceiver.direction !== 'recvonly') {
+      this._log(`Setting video transceiver direction back to recvonly for ${ps.peerId}`)
+      videoTransceiver.direction = 'recvonly'
+    }
 
     this._log(`Removed video track sender for peer ${ps.peerId}`)
-    this._negotiate(ps).catch(err => {
+    
+    // Always renegotiate after removing video to update the remote side
+    this._safeNegotiate(ps).catch(err => {
       this._log(`Failed to renegotiate after removing video for ${ps.peerId}:`, err.message)
     })
+    
+    // Verify no video tracks are being sent after removal
+    setTimeout(() => this._verifyNoVideoTracksSent(), 100)
+    
     return true
   }
 
-  stopVideo() {
+  stopVideo({ preservePlaybackRequest = false } = {}) {
     if (this._syncInterval) {
       clearInterval(this._syncInterval)
       this._syncInterval = null
@@ -1570,6 +1350,14 @@ export class VoiceConnection extends EventEmitter {
       this._peerMonitorInterval = null
     }
     const videoType = this._videoType
+    const wasTransitioning = this._videoTransitioning
+    this._clearDualStreamStartup()
+
+    if (this._dualStreamPlayer) { 
+      this._dualStreamPlayer.stop(); 
+      this._dualStreamPlayer = null 
+    }
+    this._dualStreamStarted = false
     if (this._videoPlayer) { this._videoPlayer.stop(); this._videoPlayer = null }
     if (this._player) { this._player.stop(); this._player = null }
 
@@ -1588,11 +1376,21 @@ export class VoiceConnection extends EventEmitter {
     }
     this._videoType = null
 
-    if (this._socket?.connected && videoType) {
+    if (!wasTransitioning && this._socket?.connected && videoType) {
       this._announceVideoState({ enabled: false, videoType, reason: 'stopVideo' })
     }
-
+    
+    this._videoTransitioning = false
+    if (preservePlaybackRequest) {
+      console.log('[Wire/Voice] Video stopped during transition - preserving _videoPlaybackRequested')
+    } else {
+      this._videoPlaybackRequested = false
+      console.log(`[Wire/Voice] Video stopped - resetting _videoPlaybackRequested = false`)
+    }
     this._lastVideoAnnouncementKey = null
+    
+    // Verify no video tracks are being sent after stopping
+    setTimeout(() => this._verifyNoVideoTracksSent(), 200)
   }
 
   _hasConnectedPeer() {
@@ -1603,25 +1401,45 @@ export class VoiceConnection extends EventEmitter {
   }
 
   _onPeerConnected() {
+    console.log(`[Wire/Voice] _onPeerConnected called - _videoPlaybackRequested: ${this._videoPlaybackRequested}, _videoPlayer: ${!!this._videoPlayer}, _videoTrack: ${!!this._videoTrack}`)
+    
+    if (this._dualStreamPlayer && this._videoTrack) {
+      this._addVideoTrackToPeers()
+      this._requestDualStreamStart('peer-connected')
+      return
+    }
+
     if (this._player && this._player._paused && !this._player._stopped) {
       this._log(`Peer connected — starting audio`)
       this._player.unpause()
     }
 
-    if (this._videoPlayer && this._videoTrack) {
-      this._addVideoTrackToPeers()
-      if (this._videoPlayer._paused && !this._videoPlayer._stopped) {
-        this._log(`Peer connected — starting video`)
+    // Only start video on peer join if playVideo() was explicitly called and video is already unpaused/playing
+    // Handle both regular VideoPlayer and DualStreamPlayer modes
+    const isVideoPlaying = 
+      (this._videoPlayer && this._videoTrack && !this._videoPlayer._paused && !this._videoPlayer._stopped) ||
+      (this._dualStreamPlayer && this._videoTrack)
+    
+    if (this._videoPlaybackRequested && isVideoPlaying) {
+      this._log(`Peer connected — starting video`)
+      console.log(`[Wire/Voice] Peer connected - starting video playback (video was requested)`)
+      if (this._videoPlayer) {
         this._videoPlayer.unpause()
       }
+    } else {
+      console.log(`[Wire/Voice] Peer connected - NOT starting video (requested: ${this._videoPlaybackRequested}, player: ${!!this._videoPlayer}, dualStream: ${!!this._dualStreamPlayer}, track: ${!!this._videoTrack})`)
     }
   }
 
   _resyncForPeerJoin(peerId) {
+    if (this._dualStreamPlayer) {
+      this._log(`Peer ${peerId} joined during DualStream playback - streams are already in sync`)
+      return
+    }
+    
     if (!this._player || !this._videoPlayer) return
     if (this._player._stopped || this._videoPlayer._stopped) return
 
-    // If playback is still paused globally, normal startSync flow will handle it.
     if (this._player._paused || this._videoPlayer._paused) return
 
     const audioPos = this._player.getPosition ? this._player.getPosition() : 0
@@ -1634,16 +1452,49 @@ export class VoiceConnection extends EventEmitter {
     }
 
     const barrierTime = Date.now()
+    // Use shorter delay for faster sync response
     setTimeout(() => {
       if (!this._player || !this._videoPlayer) return
       if (this._player._stopped || this._videoPlayer._stopped) return
       this._player.unpause(barrierTime)
       this._videoPlayer.unpause(barrierTime)
-    }, 120)
+    }, 80)
   }
 
   stopAudio() {
     if (this._player) { this._player.stop(); this._player = null }
+  }
+
+  seekAudio(positionMs = 0) {
+    const targetMs = Math.max(0, Number(positionMs) || 0)
+    if (!this._lastAudioPlayback?.source) {
+      return Promise.reject(new Error('No active audio to seek'))
+    }
+
+    const req = this._lastAudioPlayback
+    if (req.type === 'url') {
+      return this.playUrl(req.source, {
+        ...req.options,
+        seekMs: targetMs,
+      })
+    }
+    return this.playFile(req.source, {
+      ...req.options,
+      seekMs: targetMs,
+    })
+  }
+
+  seekVideo(positionMs = 0) {
+    const targetMs = Math.max(0, Number(positionMs) || 0)
+    if (!this._lastVideoPlayback?.filePath) {
+      return Promise.reject(new Error('No active video to seek'))
+    }
+
+    const req = this._lastVideoPlayback
+    return this.playVideo(req.filePath, {
+      ...req.options,
+      seekMs: targetMs,
+    })
   }
 
   setVoiceEffect(effect) {
@@ -1769,6 +1620,15 @@ export class VoiceConnection extends EventEmitter {
     return { ...this._voiceEffect }
   }
 
+  setUseDualStream(enabled) {
+    this._useDualStream = enabled
+    this._log(`DualStream mode ${enabled ? 'enabled' : 'disabled'}`)
+  }
+
+  getUseDualStream() {
+    return this._useDualStream
+  }
+
   _buildAudioFilter() {
     const fx = this._voiceEffect
     if (!fx.enabled || fx.type === 'none') {
@@ -1864,17 +1724,53 @@ export class VoiceConnection extends EventEmitter {
   }
 
   _buildPeerConnection(ps) {
-    const pc = new this._RTCPeerConnection({
+    this._log(`[Wire/Voice] Building peer connection with encryption: ${this._encrypted}`)
+    
+    const pcConfig = {
+      sdpSemantics: 'unified-plan',
       iceServers:   this._iceServers,
       bundlePolicy: 'max-bundle',
       rtcpMuxPolicy: 'require',
       iceCandidatePoolSize: 10,
       iceTransportPolicy: 'all',
-    })
+    }
+    
+    // DTLS-SRTP is enabled by default in WebRTC when supported
+    // The encryption is negotiated through SDP during the handshake
+    // When encrypted is false, we allow unencrypted connections (not recommended)
+    if (!this._encrypted) {
+      this._log('[Wire/Voice] WARNING: Encryption disabled - voice will be unencrypted')
+    }
+    
+    const pc = new this._RTCPeerConnection(pcConfig)
 
-    this._log(`Adding audio track to peer ${ps.peerId}`)
-    const sender = pc.addTrack(this._audioTrack, this._audioStream)
-    this._log(`Audio track added — sender exists: ${!!sender}`)
+    ps._pendingIce = []
+
+    // Use addTransceiver with tracks directly to avoid creating duplicate transceivers
+    // This is the proper way for Chrome compatibility
+    
+    // Add audio transceiver with the track directly
+    this._log(`Adding audio transceiver to peer ${ps.peerId}`)
+    const audioTransceiver = pc.addTransceiver(this._audioTrack, {
+      direction: 'sendrecv',
+      streams: [this._audioStream]
+    })
+    this._log(`Audio transceiver added — sender exists: ${!!audioTransceiver?.sender}`)
+    
+    // Only add video transceiver if video playback was explicitly requested and track exists
+    if (this._videoPlaybackRequested && this._videoTrack && this._videoStream) {
+      console.log(`[Wire/Voice] Adding video transceiver with track to peer ${ps.peerId} (video requested: ${this._videoPlaybackRequested})`)
+      const videoTransceiver = pc.addTransceiver(this._videoTrack, {
+        direction: 'sendrecv',
+        streams: [this._videoStream]
+      })
+      console.log(`[Wire/Voice] Video transceiver added — sender exists: ${!!videoTransceiver?.sender}`)
+    } else {
+      console.log(`[Wire/Voice] No video transceiver added for peer ${ps.peerId} - video not requested: ${this._videoPlaybackRequested}, track: ${!!this._videoTrack}, stream: ${!!this._videoStream}`)
+    }
+    
+    // Set codec preferences AFTER all transceivers are created
+    this._setCodecPreferences(pc)
 
     pc.onicecandidate = ({ candidate }) => {
       if (!candidate || !this._socket?.connected) return
@@ -1891,8 +1787,8 @@ export class VoiceConnection extends EventEmitter {
 
     pc.oniceconnectionstatechange = () => {
       this._log(`ICE connection state for ${ps.peerId}: ${pc.iceConnectionState}`)
-      if (pc.iceConnectionState === 'failed') {
-        this._log(`ICE failed for ${ps.peerId} — attempting ICE restart`)
+      if (pc.iceConnectionState === 'failed' || pc.iceConnectionState === 'disconnected') {
+        this._log(`ICE ${pc.iceConnectionState} for ${ps.peerId} — attempting ICE restart`)
         this._restartIce(ps)
       }
     }
@@ -1902,10 +1798,30 @@ export class VoiceConnection extends EventEmitter {
       this._reportPeerState(ps.peerId, pc.connectionState)
       
       if (pc.connectionState === 'connected') {
-        // Add video track to this peer if we have one
-        if (this._videoTrack && this._videoStream) {
-          this._log(`Peer ${ps.peerId} connected - adding video track`)
+        this._setAudioQuality(pc, 192000)
+        // Set high video bitrate for better resolution
+        if (this._videoTrack) {
+          this._setVideoBitrate(pc)
+        }
+
+        // Add video track to this peer ONLY if video playback was explicitly requested
+        if (this._videoPlaybackRequested && this._videoTrack && this._videoStream) {
+          this._log(`Peer ${ps.peerId} connected - adding video track (video requested)`)
           this._addVideoTrackToPeer(ps)
+
+          // Also start video playback if bot is playing video
+          if (this._videoPlayer && this._videoPlayer._paused && !this._videoPlayer._stopped) {
+            this._log(`Peer ${ps.peerId} connected - resuming video for new peer`)
+            this._videoPlayer.unpause()
+          }
+
+          // Announce video state to this peer so they know we're screen sharing
+          // Use a small delay to ensure the connection is fully established
+          setTimeout(() => {
+            this._announceVideoStateToPeer(ps.peerId)
+          }, 500)
+        } else {
+          this._log(`Peer ${ps.peerId} connected - skipping video track (video not requested)`)
         }
         
         if (!ps._peerJoinEmitted) {
@@ -1936,7 +1852,7 @@ export class VoiceConnection extends EventEmitter {
         ps.needsNegotiation = true
         return
       }
-      this._negotiate(ps).catch(err => {
+      this._safeNegotiate(ps).catch(err => {
         this._log(`onnegotiationneeded error for ${ps.peerId}:`, err.message)
       })
     }
@@ -1951,32 +1867,61 @@ export class VoiceConnection extends EventEmitter {
   }
 
   async _negotiate(ps, { iceRestart = false } = {}) {
-    if (!ps?.pc) return
+    console.log(`[Wire/Voice] _negotiate called for ${ps?.peerId}, iceRestart=${iceRestart}`)
+    if (!ps?.pc) {
+      console.log(`[Wire/Voice] _negotiate: no pc for ${ps?.peerId}`)
+      return
+    }
+    if (!this._canNegotiate(ps)) {
+      console.log(`[Wire/Voice] _negotiate: cooldown active for ${ps.peerId}, skipping`)
+      return
+    }
     if (ps.makingOffer) {
+      console.log(`[Wire/Voice] _negotiate: already making offer for ${ps.peerId}, queuing`)
       ps.needsNegotiation = true
       ps.needsIceRestart = ps.needsIceRestart || !!iceRestart
       return
     }
     if (ps.pc.signalingState !== 'stable') {
+      console.log(`[Wire/Voice] _negotiate: signaling state not stable for ${ps.peerId} (${ps.pc.signalingState}), queuing`)
       ps.needsNegotiation = true
       ps.needsIceRestart = ps.needsIceRestart || !!iceRestart
       return
     }
 
     const shouldIceRestart = !!iceRestart || !!ps.needsIceRestart
+    console.log(`[Wire/Voice] _negotiate: creating offer for ${ps.peerId}, iceRestart=${shouldIceRestart}`)
+    
+    // Log the tracks being sent
+    const senders = ps.pc.getSenders()
+    console.log(`[Wire/Voice] _negotiate: ${senders.length} senders for ${ps.peerId}`)
+    senders.forEach((s, i) => {
+      console.log(`[Wire/Voice] _negotiate: sender ${i} track=${s.track?.kind || 'null'}`)
+    })
+    
     try {
       ps.makingOffer = true
       ps.needsNegotiation = false
       ps.needsIceRestart = false
-      await ps.pc.setLocalDescription(await ps.pc.createOffer({ iceRestart: shouldIceRestart }))
+      const offer = await ps.pc.createOffer({ iceRestart: shouldIceRestart })
+      if (ps.pc.signalingState !== 'stable') {
+        throw new Error(`signaling-state-changed:${ps.pc.signalingState}`)
+      }
+      const tunedOffer = this._enhanceOpusSdp(offer)
+      console.log(`[Wire/Voice] _negotiate: offer created for ${ps.peerId}, sdp type=${offer.type}`)
+      await ps.pc.setLocalDescription(tunedOffer)
       this._socket.emit('voice:offer', {
         to:        ps.peerId,
         offer:     ps.pc.localDescription,
         channelId: this._channelId,
       })
-      this._log(`Sent ${shouldIceRestart ? 'ICE-restart ' : ''}offer to ${ps.peerId}`)
+      console.log(`[Wire/Voice] Sent ${shouldIceRestart ? 'ICE-restart ' : ''}offer to ${ps.peerId}`)
     } catch (err) {
-      this._log(`Negotiation failed for ${ps.peerId}:`, err.message)
+      if (String(err?.message || '').startsWith('signaling-state-changed:')) {
+        console.log(`[Wire/Voice] Negotiation deferred for ${ps.peerId}:`, err.message)
+      } else {
+        console.log(`[Wire/Voice] Negotiation failed for ${ps.peerId}:`, err.message)
+      }
       ps.needsNegotiation = true
       ps.needsIceRestart = ps.needsIceRestart || shouldIceRestart
     } finally {
@@ -1988,7 +1933,7 @@ export class VoiceConnection extends EventEmitter {
   }
 
   async _restartIce(ps) {
-    return this._negotiate(ps, { iceRestart: true })
+    return this._safeNegotiate(ps, true)
   }
 
   _flushPendingNegotiation(ps) {
@@ -1997,7 +1942,7 @@ export class VoiceConnection extends EventEmitter {
     const needsRestart = !!ps.needsIceRestart
     ps.needsNegotiation = false
     ps.needsIceRestart = false
-    this._negotiate(ps, { iceRestart: needsRestart }).catch(err => {
+    this._safeNegotiate(ps, needsRestart).catch(err => {
       this._log(`Deferred negotiation failed for ${ps.peerId}:`, err.message)
     })
   }
@@ -2005,8 +1950,24 @@ export class VoiceConnection extends EventEmitter {
   _destroyPeerState(remoteId) {
     const ps = this._peers.get(remoteId)
     if (!ps) return
-    if (ps.pc) { try { ps.pc.close() } catch {} }
+    
+    console.log(`[Wire/Voice] Destroying peer state for ${remoteId}`)
+    
+    // Remove video track from this peer before closing the connection
+    if (ps.pc && this._videoTrack) {
+      this._removeVideoTrackFromPeer(ps)
+    }
+    
+    if (ps.pc) { 
+      try { 
+        ps.pc.close() 
+        console.log(`[Wire/Voice] Peer connection closed for ${remoteId}`)
+      } catch (err) {
+        console.log(`[Wire/Voice] Error closing peer connection for ${remoteId}:`, err.message)
+      } 
+    }
     this._peers.delete(remoteId)
+    console.log(`[Wire/Voice] Peer state destroyed for ${remoteId}, remaining peers: ${this._peers.size}`)
   }
 
   _clearAllPeers() {
@@ -2019,6 +1980,10 @@ export class VoiceConnection extends EventEmitter {
     this._socket.on('voice:participants',  this._onParticipants)
     this._socket.on('voice:user-joined',   this._onUserJoined)
     this._socket.on('voice:user-left',     this._onUserLeft)
+    this._socket.on('voice:user-reconnected', this._onUserReconnected)
+    this._socket.on('voice:user-updated',  this._onUserUpdated)
+    this._socket.on('voice:video-update',   this._onVideoUpdate)
+    this._socket.on('voice:screen-share-update', this._onScreenShareUpdate)
     this._socket.on('voice:offer',         this._onOffer)
     this._socket.on('voice:answer',        this._onAnswer)
     this._socket.on('voice:ice-candidate', this._onIceCandidate)
@@ -2034,6 +1999,10 @@ export class VoiceConnection extends EventEmitter {
     this._socket.off('voice:participants',  this._onParticipants)
     this._socket.off('voice:user-joined',   this._onUserJoined)
     this._socket.off('voice:user-left',     this._onUserLeft)
+    this._socket.off('voice:user-reconnected', this._onUserReconnected)
+    this._socket.off('voice:user-updated',  this._onUserUpdated)
+    this._socket.off('voice:video-update',   this._onVideoUpdate)
+    this._socket.off('voice:screen-share-update', this._onScreenShareUpdate)
     this._socket.off('voice:offer',         this._onOffer)
     this._socket.off('voice:answer',        this._onAnswer)
     this._socket.off('voice:ice-candidate', this._onIceCandidate)
@@ -2066,7 +2035,34 @@ export class VoiceConnection extends EventEmitter {
       this._restartIce(ps).catch(err => {
         this._log(`Resync renegotiation failed:`, err.message)
       })
+    } else {
+      // If no specific peer or peer not connected, try to sync with all peers
+      this._resyncAllPeers()
     }
+  }
+  
+  _resyncAllPeers() {
+    if (!this._player || !this._videoPlayer) return
+    if (this._player._paused || this._videoPlayer._paused) return
+    
+    const audioPos = this._player.getPosition ? this._player.getPosition() : 0
+    this._log(`Syncing all peers to audio position: ${Math.round(audioPos)}ms`)
+    
+    // Pause both briefly and resync
+    try { this._player.pause() } catch {}
+    try { this._videoPlayer.pause() } catch {}
+    
+    if (this._videoPlayer.resync) {
+      try { this._videoPlayer.resync(audioPos) } catch {}
+    }
+    
+    const barrierTime = Date.now()
+    setTimeout(() => {
+      if (this._player && this._videoPlayer) {
+        this._player.unpause(barrierTime)
+        this._videoPlayer.unpause(barrierTime)
+      }
+    }, 50)
   }
 
   _onParticipants({ channelId, participants }) {
@@ -2141,14 +2137,123 @@ export class VoiceConnection extends EventEmitter {
     const peerCount = this._peers.size
     const delay = tier.staggerBase + (peerCount * tier.staggerPerPeer * 0.5) + (Math.random() * 300)
     setTimeout(() => this._queueConnection(userId), delay)
+    
+    // Announce video state to the new user after connection is established
+    // This ensures new joiners see the bot's screen share/video
+    if (this._videoTrack && this._videoType) {
+      setTimeout(() => {
+        this._announceVideoStateToPeer(userId)
+      }, delay + 2000)  // Wait longer for connection to be established
+    }
   }
 
   _onUserLeft(data) {
     const userId = data?.userId || data?.id
     if (!userId || userId === this._botId) return
     this._log('User left voice:', userId)
+    console.log(`[Wire/Voice] User ${userId} left voice - cleaning up peer state and video tracks`)
     this._destroyPeerState(userId)
     this.emit('peerLeave', userId)
+  }
+
+  _onUserReconnected(userInfo) {
+    const userId = userInfo?.id || userInfo?.userId
+    if (!userId || userId === this._botId) return
+    this._log('User reconnected to voice:', userId)
+    
+    // Destroy existing peer state and reconnect
+    this._destroyPeerState(userId)
+    
+    if (!this._canAcceptPeer(userId)) {
+      this._log(`Cannot accept reconnected peer ${userId}: at capacity`)
+      return
+    }
+    
+    const tier = this._getTierConfig()
+    const delay = tier.staggerBase + (Math.random() * 200)
+    setTimeout(() => this._queueConnection(userId), delay)
+    
+    // Re-announce video state to the reconnected user after a short delay
+    // This ensures they receive the current screen share/video state
+    if (this._videoTrack && this._videoType) {
+      setTimeout(() => {
+        this._announceVideoStateToPeer(userId)
+      }, delay + 1000)
+    }
+  }
+  
+  // Announce current video state to a specific peer (for reconnections)
+  _announceVideoStateToPeer(peerId) {
+    if (!this._socket?.connected || !this._videoType) return
+    
+    const eventName = this._getVideoSignalEvent(this._videoType)
+    if (!eventName) return
+    
+    // Send directly to the specific peer
+    this._socket.emit(eventName, {
+      channelId: this._channelId,
+      userId: this._botId,
+      enabled: true,
+      targetPeerId: peerId,  // Target specific peer
+    })
+    
+    // Also emit the update event
+    const updateEventName = this._videoType === 'screen' ? 'voice:screen-share-update' : 'voice:video-update'
+    this._socket.emit(updateEventName, {
+      channelId: this._channelId,
+      userId: this._botId,
+      enabled: true,
+      type: this._videoType,
+      videoType: this._videoType,
+      targetPeerId: peerId,  // Target specific peer
+    })
+    
+    this._log(`Announced video state to peer ${peerId} (type: ${this._videoType})`)
+  }
+
+  _onUserUpdated(data) {
+    const { userId, channelId, hasVideo, hasScreenShare, isMuted, isDeafened, isSelfMuted, isSelfDeafened } = data
+    if (channelId !== this._channelId) return
+    if (userId === this._botId) return
+    
+    this._log(`User ${userId} updated: video=${hasVideo}, screen=${hasScreenShare}, muted=${isMuted}`)
+    
+    // Emit event for external handlers (like Wilmer bot)
+    this.emit('peerUpdate', { peerId: userId, hasVideo, hasScreenShare, isMuted, isDeafened, isSelfMuted, isSelfDeafened })
+  }
+
+  _onVideoUpdate(data) {
+    const { userId, channelId, enabled, videoType } = data
+    if (channelId !== this._channelId) return
+    if (userId === this._botId) return
+    
+    this._log(`User ${userId} video ${enabled ? 'enabled' : 'disabled'} (type: ${videoType})`)
+    
+    // Emit event for external handlers
+    this.emit('peerVideoUpdate', { peerId: userId, enabled, videoType })
+    
+    // If video was disabled, we might need to resync
+    if (!enabled && this._videoPlayer) {
+      this._log(`Peer ${userId} disabled video - triggering resync`)
+      this._resyncAllPeers()
+    }
+  }
+
+  _onScreenShareUpdate(data) {
+    const { userId, channelId, enabled, type } = data
+    if (channelId !== this._channelId) return
+    if (userId === this._botId) return
+    
+    this._log(`User ${userId} screen share ${enabled ? 'enabled' : 'disabled'} (type: ${type})`)
+    
+    // Emit event for external handlers
+    this.emit('peerScreenShareUpdate', { peerId: userId, enabled, type })
+    
+    // If screen share was disabled, we might need to resync
+    if (!enabled && this._videoPlayer) {
+      this._log(`Peer ${userId} disabled screen share - triggering resync`)
+      this._resyncAllPeers()
+    }
   }
 
   _onForceReconnect(data) {
@@ -2294,10 +2399,11 @@ export class VoiceConnection extends EventEmitter {
       await pc.setRemoteDescription(new this._RTCSessionDescription(offer))
       ps.remoteDescSet = true
 
-      await this._flushCandidates(ps)
+      await this._flushPendingIce(ps)
 
       const answer = await pc.createAnswer()
-      await pc.setLocalDescription(answer)
+      const tunedAnswer = this._enhanceOpusSdp(answer)
+      await pc.setLocalDescription(tunedAnswer)
 
       this._socket.emit('voice:answer', {
         to:        from,
@@ -2325,7 +2431,7 @@ export class VoiceConnection extends EventEmitter {
       ps.remoteDescSet = true
       ps.ignoreOffer = false
       this._log(`Set remote answer from ${from}`)
-      await this._flushCandidates(ps)
+      await this._flushPendingIce(ps)
       this._pollForConnected(ps)
       this._flushPendingNegotiation(ps)
     } catch (err) {
@@ -2358,7 +2464,11 @@ export class VoiceConnection extends EventEmitter {
       if (!ps.pc) return
       if (ps.pc.connectionState === 'connected') {
         this._log(`Poll detected connected for ${ps.peerId}`)
-        this._onPeerConnected()
+        if (!ps._peerJoinEmitted) {
+          ps._peerJoinEmitted = true
+          this._onPeerConnected()
+          this.emit('peerJoin', ps.peerId)
+        }
         return
       }
       this._pollForConnected(ps, attempts + 1)
@@ -2368,14 +2478,8 @@ export class VoiceConnection extends EventEmitter {
   _onIceCandidate({ from, candidate, channelId }) {
     if (channelId !== this._channelId) return
     const ps = this._peers.get(from)
-    if (!ps) return
+    if (!ps || !ps.pc) return
 
-    if (ps.remoteDescSet && ps.pc) {
-      ps.pc.addIceCandidate(new this._RTCIceCandidate(candidate)).catch(err => {
-        this._log(`Error adding ICE candidate:`, err.message)
-      })
-    } else {
-      ps.pendingCandidates.push(candidate)
-    }
+    this._addIceCandidate(ps, new this._RTCIceCandidate(candidate))
   }
 }
