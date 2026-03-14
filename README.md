@@ -126,8 +126,13 @@ bot.on('voiceJoin',      (data)    => {})   // { userId, channelId, … }
 bot.on('voiceLeave',     (data)    => {})
 bot.on('voiceUpdate',    (data)    => {})
 bot.on('userStatus',     (data)    => {})   // { userId, status, customStatus, isBot }
-bot.on('peerJoin',       (userId)  => {})   // VoiceConnection event (see Voice)
+bot.on('peerJoin',       (userId)  => {})  // VoiceConnection event (see Voice)
 bot.on('peerLeave',      (userId)  => {})
+bot.on('ui:interaction', (data)    => {})  // Bot UI interaction event
+bot.on('ui:buttonClick', (data)    => {})  // Button clicked
+bot.on('ui:inputSubmit', (data)    => {})  // Input submitted
+bot.on('ui:selectChange',(data)    => {})  // Select changed
+bot.on('ui:canvasClick',(data)    => {})  // Canvas pixel clicked
 bot.on('disconnect',     (reason)  => {})
 bot.on('reconnect',      ()        => {})
 bot.on('error',          (err)     => {})
@@ -417,6 +422,179 @@ const embed = new Embed()
   .setTimestamp()
 
 await bot.send(channelId, '', { embeds: [embed.toJSON()] })
+```
+
+---
+
+### Bot UI Toolkit
+
+Wire includes a powerful UI toolkit for creating interactive messages with buttons, inputs, selects, canvas drawings, and more. These interactive messages allow bots to create rich user experiences with polls, forms, games, and more.
+
+```js
+import { 
+  InteractiveMessage,
+  BotButton, 
+  BotInput, 
+  BotSelect, 
+  BotCanvas,
+  BotText,
+  BotImage,
+  BotDivider,
+  BotSpacer,
+  BotActionRow
+} from '@voltchat/wire'
+```
+
+#### Interactive Messages
+
+Create interactive messages with UI components:
+
+```js
+// Create an interactive message
+const msg = bot.createInteractiveMessage()
+msg.setContent('Choose an option:')
+
+// Add buttons
+const row = msg.addActionRow()
+row.addButton({
+  label: 'Yes',
+  emoji: '✅',
+  variant: 'success',
+  action: 'confirm'
+})
+row.addButton({
+  label: 'No',
+  emoji: '❌',
+  variant: 'danger',
+  action: 'deny'
+})
+
+// Send the interactive message
+await bot.sendUI(channelId, msg)
+```
+
+#### Buttons
+
+```js
+const button = bot.createButton({
+  label: 'Click Me',
+  emoji: '👋',
+  variant: 'primary', // primary, secondary, danger, success, link
+  action: 'my_action',
+  confirm: 'Are you sure?'
+})
+```
+
+#### Input Fields
+
+```js
+const input = bot.createInput({
+  label: 'Your Name',
+  placeholder: 'Enter your name...',
+  required: true,
+  minLength: 2,
+  maxLength: 50,
+  action: 'submit_name'
+})
+```
+
+#### Select/Dropdown
+
+```js
+const select = bot.createSelect({
+  placeholder: 'Choose a color',
+  multiple: false
+})
+select.addOption('red', 'Red', '🔴')
+select.addOption('blue', 'Blue', '🔵')
+select.addOption('green', 'Green', '🟢')
+```
+
+#### Canvas (Pixel Drawing)
+
+```js
+const canvas = bot.createCanvas({
+  width: 100,
+  height: 100,
+  interactive: true, // Allow users to click and draw
+  action: 'pixel_click'
+})
+
+// Pre-draw some pixels
+canvas.setPixel(50, 50, '#ff0000')
+canvas.setPixel(51, 50, '#00ff00')
+canvas.setPixel(50, 51, '#0000ff')
+```
+
+#### Complete Example
+
+```js
+// Create a poll
+const poll = bot.createInteractiveMessage()
+poll.setContent('What is your favorite programming language?')
+
+const row = poll.addActionRow()
+row.addButton({ label: 'JavaScript', emoji: '📜', variant: 'primary', action: 'vote_js' })
+row.addButton({ label: 'Python', emoji: '🐍', variant: 'primary', action: 'vote_py' })
+row.addButton({ label: 'Rust', emoji: '🦀', variant: 'primary', action: 'vote_rust' })
+
+const pollMsg = await bot.sendUI(channelId, poll)
+
+// Listen for button clicks
+bot.on('ui:buttonClick', async (data) => {
+  if (data.action === 'vote_js') {
+    await bot.send(channelId, 'You voted for JavaScript!')
+  }
+})
+```
+
+#### Convenience Methods
+
+```js
+// Quick button message
+await bot.sendButtons(channelId, 'Pick one:', [
+  { label: 'Option A', action: 'a' },
+  { label: 'Option B', action: 'b' }
+])
+
+// Quick canvas message
+const canvas = bot.createCanvas({ width: 50, height: 50, interactive: true })
+canvas.setPixel(25, 25, '#ffffff')
+await bot.sendCanvas(channelId, 'Draw something!', canvas)
+
+// Quick form
+await bot.sendForm(channelId, 'Enter your feedback:', [
+  { label: 'Feedback', placeholder: 'Your feedback...', required: true }
+])
+```
+
+#### Listening for Interactions
+
+```js
+// Listen for any UI interaction
+bot.on('ui:interaction', (data) => {
+  console.log('Interaction:', data.componentId, data.action, data.value, data.userId)
+})
+
+// Listen for specific interactions
+bot.on('ui:buttonClick', (data) => {
+  console.log('Button clicked:', data.label, data.action)
+})
+
+bot.on('ui:inputSubmit', (data) => {
+  console.log('Input submitted:', data.componentId, data.value)
+})
+
+bot.on('ui:selectChange', (data) => {
+  console.log('Select changed:', data.componentId, data.value)
+})
+
+bot.on('ui:canvasClick', (data) => {
+  console.log('Canvas clicked:', data.componentId, data.x, data.y)
+})
+
+// Wait for a specific interaction
+const result = await bot.awaitUIInteraction(messageId, componentId, 30000)
 ```
 
 ---

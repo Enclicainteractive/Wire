@@ -12,3 +12,18 @@ export { WireCUI }                              from './WireCUI.js'
 export { GatewayEvents, Intents, Permissions, BotStatus } from './constants.js'
 
 export * as Encryption from './Encryption.js'
+
+export {
+  InteractiveMessage,
+  InteractiveMessageManager,
+  BotUIComponent,
+  BotButton,
+  BotInput,
+  BotSelect,
+  BotCanvas,
+  BotText,
+  BotImage,
+  BotDivider,
+  BotSpacer,
+  BotActionRow
+} from './BotUI.js'

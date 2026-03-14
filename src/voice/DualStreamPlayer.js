@@ -424,12 +424,21 @@ export class DualStreamPlayer extends EventEmitter {
       if (this._stopped) return
 
       // Handle null code - process was killed externally or crashed unexpectedly
-      // Don't retry with same URL for null code as it's likely an external kill or expired URL
+      // Only emit urlExpired for non-YouTube URLs that could be re-resolved
+      // Direct URLs and YouTube direct URLs don't expire, so treat them as retryable
       if (code === null) {
         const anyHttpInput = isHttpInput(this._videoUrl) || isHttpInput(this._audioUrl)
-        if (anyHttpInput) {
+        const anyYouTubeDirect = isYouTubeDirectUrl(this._videoUrl) || isYouTubeDirectUrl(this._audioUrl)
+        if (anyHttpInput && !anyYouTubeDirect) {
           this._log(`ffmpeg killed externally (code=${code}), emitting error for URL re-resolution`)
           this.emit('urlExpired', new Error('ffmpeg killed externally, URL may be expired'))
+          return
+        }
+        // For direct URLs or YouTube direct, retry instead of giving up
+        if (anyHttpInput && this._retryCount < MAX_PLAYER_RETRY_ATTEMPTS) {
+          this._retryCount++
+          this._log(`ffmpeg killed externally (code=${code}), retrying (attempt ${this._retryCount}/${MAX_PLAYER_RETRY_ATTEMPTS})`)
+          this._retryTimer = setTimeout(() => this._spawnFfmpeg(), FFMPEG_RETRY_BACKOFF_MS * this._retryCount)
           return
         }
         return

@@ -77,6 +77,7 @@ export class AudioPlayer extends EventEmitter {
     const frameSize = FRAME_BYTES
     this._ffmpeg.stdout.on('data', (chunk) => {
       this._buf = Buffer.concat([this._buf, chunk])
+      // Wait for more buffer on startup to prevent cutting
       const maxStartupFrames = Math.max(1, LOW_LATENCY_START_BUFFER_FRAMES)
       const frameLimit = this._paused && !this._startTime
         ? maxStartupFrames
@@ -116,10 +117,10 @@ export class AudioPlayer extends EventEmitter {
 
   // Pre-buffer blank/silence frames to give time for RTC connection establishment
   _preBufferBlankFrames() {
-    // 6 seconds of silence at 48kHz = 288000 samples
+    // 7 seconds of silence at 48kHz = 336000 samples
     // Each frame is 480 samples (10ms at 48kHz)
-    // So we need 288000 / 480 = 600 frames
-    const blankFrameCount = 600
+    // So we need 336000 / 480 = 700 frames
+    const blankFrameCount = 700
     const blankData = Buffer.alloc(FRAME_BYTES) // silence is zeros
     
     // Add blank frames to buffer
@@ -127,7 +128,7 @@ export class AudioPlayer extends EventEmitter {
       this._buf = Buffer.concat([this._buf, blankData])
     }
     
-    this._log(`Pre-buffered ${blankFrameCount} blank audio frames (6s) for RTC establishment`)
+    this._log(`Pre-buffered ${blankFrameCount} blank audio frames (7s) for RTC establishment`)
   }
 
   _log(...args) {
@@ -170,8 +171,8 @@ export class AudioPlayer extends EventEmitter {
     
     // Use wall clock for accurate sync (better for A/V alignment)
     const elapsedMs = Date.now() - this._startTime - this._pausedTime
-    // Subtract preroll time since that's just silence (7s for audio - 1s more than video)
-    const contentElapsedMs = Math.max(0, elapsedMs - AUDIO_PREROLL_BUFFER_MS)
+    // Subtract preroll time since that's just silence (7s for audio - more than video)
+    const contentElapsedMs = Math.max(0, elapsedMs - 1500) // Updated to match new preroll
     return contentElapsedMs + RTC_DELAY_MS
   }
 

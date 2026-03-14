@@ -39,6 +39,7 @@ export class StreamPlayer extends EventEmitter {
     this._suppressNextClose = false
     this._retryCount = 0
     this._lastFfmpegError = ''
+    this._isYouTubeDirect = false
     this._debugLabel = 'Stream'
     this._trimLogCooldownMs = 1200
     this._lastTrimLogAt = 0
@@ -70,8 +71,8 @@ export class StreamPlayer extends EventEmitter {
     }
 
     const isHttpUrl = isHttpInput(this._url)
-    const isYouTubeDirect = isYouTubeDirectUrl(this._url)
-    const userAgent = isYouTubeDirect ? YOUTUBE_DIRECT_HTTP_USER_AGENT : DEFAULT_HTTP_USER_AGENT
+    this._isYouTubeDirect = isYouTubeDirectUrl(this._url)
+    const userAgent = this._isYouTubeDirect ? YOUTUBE_DIRECT_HTTP_USER_AGENT : DEFAULT_HTTP_USER_AGENT
     const extraHeaders = parseExtraHttpHeaders(process.env.WIRE_FFMPEG_EXTRA_HEADERS || '')
     
     const args = [
@@ -88,7 +89,7 @@ export class StreamPlayer extends EventEmitter {
       args.push(
         '-re',
         ...buildHttpInputArgs(this._url, userAgent, {
-          isYouTubeDirect,
+          isYouTubeDirect: this._isYouTubeDirect,
           extraHeaders,
         })
       )
@@ -152,11 +153,19 @@ export class StreamPlayer extends EventEmitter {
       console.log(`[Wire/Voice/Stream] ffmpeg closed (code=${code})`)
       
       // Handle null code - process was killed externally or crashed unexpectedly
-      // Don't retry with same URL for null code as it's likely an external kill
+      // Only emit urlExpired for non-YouTube URLs that could be re-resolved
+      // Direct URLs and YouTube direct URLs don't expire, so treat them as retryable
       if (code === null) {
-        if (!this._stopped && isHttpUrl) {
+        if (!this._stopped && isHttpUrl && !this._isYouTubeDirect) {
           this._log(`ffmpeg killed externally (code=${code}), emitting error for URL re-resolution`)
           this.emit('urlExpired', new Error('ffmpeg killed externally, URL may be expired'))
+          return
+        }
+        // For direct URLs or YouTube direct, retry instead of giving up
+        if (!this._stopped && isHttpUrl && this._retryCount < MAX_PLAYER_RETRY_ATTEMPTS) {
+          this._retryCount++
+          this._log(`ffmpeg killed externally (code=${code}), retrying (attempt ${this._retryCount}/${MAX_PLAYER_RETRY_ATTEMPTS})`)
+          this._retryTimer = setTimeout(() => this._spawnFfmpeg(), FFMPEG_RETRY_BACKOFF_MS * this._retryCount)
           return
         }
         return

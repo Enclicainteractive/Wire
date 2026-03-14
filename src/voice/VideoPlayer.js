@@ -37,6 +37,7 @@ export class VideoPlayer extends EventEmitter {
     this._pausedTime = 0 // Total time spent paused (for wall-clock position)
     this._pauseStart = null // When we paused (to track paused duration)
     this._isUrl      = isHttpInput(this._filePath)
+    this._isYouTubeDirect = isYouTubeDirectUrl(this._filePath)
     
     // Sync tracking
     this._lastFrameTime = null
@@ -224,11 +225,19 @@ export class VideoPlayer extends EventEmitter {
       console.log(`[Wire/Voice/Video] ffmpeg closed (code=${code})`)
       
       // Handle null code - process was killed externally or crashed unexpectedly
-      // Don't retry with same URL for null code as it's likely an external kill
+      // Only emit urlExpired for non-YouTube URLs that could be re-resolved
+      // Direct URLs and YouTube direct URLs don't expire, so treat them as retryable
       if (code === null) {
-        if (!this._stopped && this._isUrl) {
+        if (!this._stopped && this._isUrl && !this._isYouTubeDirect) {
           this._log(`ffmpeg killed externally (code=${code}), emitting error for URL re-resolution`)
           this.emit('urlExpired', new Error('ffmpeg killed externally, URL may be expired'))
+          return
+        }
+        // For direct URLs or YouTube direct, retry instead of giving up
+        if (!this._stopped && this._isUrl && this._retryCount < MAX_PLAYER_RETRY_ATTEMPTS) {
+          this._retryCount++
+          this._log(`ffmpeg killed externally (code=${code}), retrying (attempt ${this._retryCount}/${MAX_PLAYER_RETRY_ATTEMPTS})`)
+          this._retryTimer = setTimeout(() => this._spawnFfmpeg(), FFMPEG_RETRY_BACKOFF_MS * this._retryCount)
           return
         }
         return

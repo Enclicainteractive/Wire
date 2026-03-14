@@ -8,6 +8,7 @@ import { WireCUI } from './WireCUI.js'
 import { VoiceConnection } from './VoiceConnection.js'
 import { GatewayEvents, BotStatus } from './constants.js'
 import * as Encryption from './Encryption.js'
+import { InteractiveMessageManager, InteractiveMessage, BotButton, BotInput, BotSelect, BotCanvas, BotText, BotImage, BotDivider, BotSpacer, BotActionRow } from './BotUI.js'
 
 export class Client extends EventEmitter {
   constructor(options = {}) {
@@ -39,6 +40,9 @@ export class Client extends EventEmitter {
 
     // Voice — keyed by serverId so one connection per server
     this._voiceConnections = new Map()  // serverId -> VoiceConnection
+
+    // Bot UI — Interactive message handling
+    this.ui = new InteractiveMessageManager(this)
   }
 
   // ---------------------------------------------------------------------------
@@ -187,6 +191,11 @@ export class Client extends EventEmitter {
       this.socket.on('connect', () => {
         this._log('WebSocket connected (transport:', this.socket.io.engine.transport.name + ')')
         this.socket.emit('bot:connect', { botToken: this.token })
+      })
+
+      // Respond to server heartbeat pings to keep the connection alive
+      this.socket.on('ws:ping', () => {
+        this.socket.emit('ws:pong')
       })
 
       this.socket.on('bot:ready', (data) => {
@@ -428,6 +437,37 @@ export class Client extends EventEmitter {
         this.emit('voiceUpdate', data)
       })
 
+      // -- Bot UI Interactions --
+
+      this.socket.on('ui:buttonClick', (data) => {
+        this._log('Button clicked:', data)
+        this.emit('ui:buttonClick', data)
+        this.emit('ui:interaction', { ...data, action: 'buttonClick' })
+      })
+
+      this.socket.on('ui:inputSubmit', (data) => {
+        this._log('Input submitted:', data)
+        this.emit('ui:inputSubmit', data)
+        this.emit('ui:interaction', { ...data, action: 'inputSubmit' })
+      })
+
+      this.socket.on('ui:selectChange', (data) => {
+        this._log('Select changed:', data)
+        this.emit('ui:selectChange', data)
+        this.emit('ui:interaction', { ...data, action: 'selectChange' })
+      })
+
+      this.socket.on('ui:canvasClick', (data) => {
+        this._log('Canvas clicked:', data)
+        this.emit('ui:canvasClick', data)
+        this.emit('ui:interaction', { ...data, action: 'canvasClick' })
+      })
+
+      this.socket.on('ui:interaction', (data) => {
+        this._log('UI interaction:', data)
+        this.emit('ui:interaction', data)
+      })
+
       // -- Presence --
 
       this.socket.on(GatewayEvents.USER_STATUS, (data) => {
@@ -489,6 +529,84 @@ export class Client extends EventEmitter {
    */
   async send(channelId, content, options = {}) {
     return this.rest.sendMessage(channelId, content, options)
+  }
+
+  /**
+   * Create a new interactive message builder.
+   * @returns {InteractiveMessage}
+   */
+  createInteractiveMessage() {
+    return new InteractiveMessage()
+  }
+
+  /**
+   * Send an interactive message with UI components.
+   * @param {string} channelId 
+   * @param {InteractiveMessage} interactiveMessage 
+   * @returns {Promise<object>}
+   */
+  async sendUI(channelId, interactiveMessage) {
+    const payload = interactiveMessage.toMessagePayload()
+    const result = await this.rest.sendMessage(channelId, payload.content || '', {
+      embeds: payload.embeds,
+      ui: payload.ui
+    })
+    if (result?.id) {
+      this.ui.track(result.id, interactiveMessage)
+    }
+    return result
+  }
+
+  /**
+   * Send an interactive message with buttons.
+   * @param {string} channelId 
+   * @param {string} content 
+   * @param {BotButton[]} buttons 
+   * @returns {Promise<object>}
+   */
+  async sendButtons(channelId, content, buttons) {
+    const msg = this.createInteractiveMessage()
+      .setContent(content)
+    
+    const row = msg.addActionRow()
+    for (const button of buttons) {
+      row.addButton(button)
+    }
+    
+    return this.sendUI(channelId, msg)
+  }
+
+  /**
+   * Send an interactive message with a canvas.
+   * @param {string} channelId 
+   * @param {string} content 
+   * @param {BotCanvas} canvas 
+   * @returns {Promise<object>}
+   */
+  async sendCanvas(channelId, content, canvas) {
+    const msg = this.createInteractiveMessage()
+      .setContent(content)
+      .addCanvas(canvas)
+    
+    return this.sendUI(channelId, msg)
+  }
+
+  /**
+   * Send an interactive message with a form.
+   * @param {string} channelId 
+   * @param {string} content 
+   * @param {BotInput[]} inputs 
+   * @returns {Promise<object>}
+   */
+  async sendForm(channelId, content, inputs) {
+    const msg = this.createInteractiveMessage()
+      .setContent(content)
+    
+    for (const input of inputs) {
+      msg.addInput(input)
+    }
+    
+    return this.sendUI(channelId, msg)
   }
 
   /**
@@ -891,6 +1009,116 @@ export class Client extends EventEmitter {
    */
   createCUI(channelId, options = {}) {
     return new WireCUI(this, { channelId, ...options })
+  }
+
+  // ---------------------------------------------------------------------------
+  // Bot UI - Interactive Components
+  // ---------------------------------------------------------------------------
+
+  /**
+   * Create a button component.
+   * @param {object} options
+   * @returns {BotButton}
+   */
+  createButton(options = {}) {
+    return new BotButton(options)
+  }
+
+  /**
+   * Create an input component.
+   * @param {object} options
+   * @returns {BotInput}
+   */
+  createInput(options = {}) {
+    return new BotInput(options)
+  }
+
+  /**
+   * Create a select/dropdown component.
+   * @param {object} options
+   * @returns {BotSelect}
+   */
+  createSelect(options = {}) {
+    return new BotSelect(options)
+  }
+
+  /**
+   * Create a canvas component for drawing.
+   * @param {object} options
+   * @returns {BotCanvas}
+   */
+  createCanvas(options = {}) {
+    return new BotCanvas(options)
+  }
+
+  /**
+   * Create a text component.
+   * @param {object} options
+   * @returns {BotText}
+   */
+  createText(options = {}) {
+    return new BotText(options)
+  }
+
+  /**
+   * Create an image component.
+   * @param {object} options
+   * @returns {BotImage}
+   */
+  createImage(options = {}) {
+    return new BotImage(options)
+  }
+
+  /**
+   * Create a divider component.
+   * @param {object} options
+   * @returns {BotDivider}
+   */
+  createDivider(options = {}) {
+    return new BotDivider(options)
+  }
+
+  /**
+   * Create a spacer component.
+   * @param {object} options
+   * @returns {BotSpacer}
+   */
+  createSpacer(options = {}) {
+    return new BotSpacer(options)
+  }
+
+  /**
+   * Create an action row with components.
+   * @param {object} options
+   * @returns {BotActionRow}
+   */
+  createActionRow(options = {}) {
+    return new BotActionRow(options)
+  }
+
+  /**
+   * Wait for a UI interaction.
+   * @param {string} messageId
+   * @param {string} componentId
+   * @param {number} timeoutMs
+   * @returns {Promise<object>}
+   */
+  awaitUIInteraction(messageId, componentId, timeoutMs = 60000) {
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(() => {
+        this.off('ui:interaction', onInteraction)
+        reject(new Error('Timed out waiting for UI interaction'))
+      }, timeoutMs)
+
+      const onInteraction = (data) => {
+        if (data.messageId !== messageId || data.componentId !== componentId) return
+        clearTimeout(timer)
+        this.off('ui:interaction', onInteraction)
+        resolve(data)
+      }
+
+      this.on('ui:interaction', onInteraction)
+    })
   }
 
   // ---------------------------------------------------------------------------
